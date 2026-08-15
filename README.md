@@ -18,6 +18,7 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - Physical button (GPIO 14): short press shows current IP on display for 5 s, long press (2 s) forces AP mode
 - On-screen overlay notifications for all WiFi mode transitions and VFD faults
 - All runtime settings persist across reboots via EEPROM
+- Onboard LED blinks at 1 Hz while the VFD is running, 0.25 Hz while stopped
 
 ## Hardware
 
@@ -350,7 +351,7 @@ All other registers within the normal A1000 address range return `0x0000` on rea
 
 The simulated drive ramps its output frequency at ~0.5 Hz/s toward the commanded reference, giving a realistic response to acceleration/deceleration commands.
 
-The onboard LED blinks at **1 Hz** while the simulated drive is running, and **0.25 Hz** while stopped.
+The onboard LED blinks at **1 Hz** while the simulated drive is running, and **0.25 Hz** while stopped. Both firmware targets use the same blink rates so the behaviour is consistent across the bench setup.
 
 ### Simulator wiring (MAX485 breakout → standard Pico)
 

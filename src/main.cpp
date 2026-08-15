@@ -1539,6 +1539,8 @@ void setup()
 {
     Serial.begin(115200);
 
+    pinMode(PIN_LED, OUTPUT);
+
     /* Encoder — interrupt on rising edge of channel A */
     pinMode(ENCODER_A, INPUT_PULLUP);
     pinMode(ENCODER_B, INPUT_PULLUP);
@@ -1713,6 +1715,16 @@ void loop()
     if (now - last_vfd_ms >= VFD_POLL_MS) {
         last_vfd_ms = now;
         vfd_poll();
+    }
+
+    /* ---- Onboard LED: 1 Hz when VFD running, 0.25 Hz when stopped ---- */
+    static uint32_t last_led_ms = 0;
+    static bool     led_state   = false;
+    uint32_t blink_ms = vfd_running ? 500 : 2000;
+    if (now - last_led_ms >= blink_ms) {
+        last_led_ms = now;
+        led_state   = !led_state;
+        digitalWrite(PIN_LED, led_state);
     }
 
     /* Service web requests */
