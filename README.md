@@ -79,17 +79,21 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 
 Connect your 2-phase stepper motor coils to the **A1/A2** and **B1/B2** terminals on the TMC5160 board.
 
-### SparkFun RS-485 Breakout → Pico 2W (UART1)
+### SparkFun SP3485 Breakout → Pico 2W (UART1)
 
-| RS-485 Breakout Pin | Pico 2W GPIO | Pico 2W Pin |
-|---|---|---|
-| TX-O | GPIO 9 (UART1 RX) | Pin 12 |
-| RX-I | GPIO 8 (UART1 TX) | Pin 11 |
-| DE | GPIO 7 | Pin 10 |
-| VCC | 3.3 V | Pin 36 |
-| GND | GND | Any GND |
+The SparkFun SP3485 is a 3.3 V RS-485 transceiver breakout. It is pin-compatible with the MAX485 but operates natively at 3.3 V — no level shifting required.
 
-> DE is driven HIGH to transmit and LOW to receive. The firmware handles this automatically around every Modbus transaction.
+| SP3485 Breakout Pin | Direction | Pico 2W GPIO | Pico 2W Pin |
+|---|---|---|---|
+| RX-I (driver input) | Pico → breakout | GPIO 8 (UART1 TX) | Pin 11 |
+| TX-O (receiver output) | Breakout → Pico | GPIO 9 (UART1 RX) | Pin 12 |
+| DE | Transmit enable | GPIO 7 | Pin 10 |
+| VCC | Power | 3.3 V | Pin 36 |
+| GND | Ground | GND | Any GND |
+
+> **RX-I / TX-O naming is from the breakout's perspective relative to the RS-485 bus** — the opposite of what you'd expect from the Pico side. RX-I is the breakout receiving from the Pico (Pico TX). TX-O is the breakout transmitting to the Pico (Pico RX). Swapping these two wires is the most common wiring mistake and will produce zero response bytes from the drive.
+
+> DE is driven HIGH to transmit and LOW to receive. The firmware handles this automatically around every Modbus transaction. The SP3485 breakout ties DE and RE together on-board, so a single GPIO controls both.
 
 ### RS-485 → Yaskawa A1000 VFD
 
@@ -273,7 +277,7 @@ The UI has two tabs:
 | `/vfd-freq` | POST | `hz` (0.01 Hz units) | Set VFD frequency reference directly in 0.01 Hz units |
 | `/vfd-reset` | POST | — | Reset active VFD fault |
 | `/vfd-settings` | POST | `slave`, `maxhz`, `basehz`, `baserpm` | Set slave address, max/baseline frequency, baseline RPM |
-| `/vfd-status` | GET | — | Returns JSON: `{comms_ok, running, status, fault, freq, base_hz, base_rpm}` |
+| `/vfd-status` | GET | — | Returns JSON: `{comms_ok, running, status, fault, freq, output_freq, base_hz, base_rpm}` |
 
 ## Physical Controls
 

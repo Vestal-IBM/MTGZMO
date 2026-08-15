@@ -57,11 +57,16 @@ static uint16_t vfd_base_hz    = 6000;  /* Baseline frequency (0.01 Hz units) fo
 static uint16_t vfd_base_rpm   = 1750;  /* Motor RPM at baseline frequency */
 
 /* Live VFD state updated by vfd_poll() */
-static volatile uint16_t vfd_status_word = 0;
-static volatile uint16_t vfd_fault_code  = 0;
-static volatile bool     vfd_running     = false;
-static volatile uint16_t vfd_freq_ref    = 0;   /* last written frequency reference */
-static volatile bool     vfd_comms_ok    = false;
+static volatile uint16_t vfd_status_word  = 0;
+static volatile uint16_t vfd_fault_code   = 0;
+static volatile bool     vfd_running      = false;
+static volatile uint16_t vfd_freq_ref     = 0;   /* last written frequency reference */
+static volatile uint16_t vfd_output_freq  = 0;   /* actual output frequency (reg 0x0025) */
+static volatile bool     vfd_comms_ok     = false;
+
+/* When false, raw TX/RX byte dumps and FC03 OK lines are suppressed.
+   Set true around explicit commands; left false during background polls. */
+static bool vfd_log_raw = false;
 
 /* ---- WiFi ---- */
 #define WIFI_AP_SSID  "MTGizmo"
@@ -334,13 +339,15 @@ static void vfd_send_frame(const uint8_t *frame, uint8_t len)
     Serial2.flush();                /* blocks until TX shift register is empty */
     digitalWrite(VFD_DE_PIN, LOW);
 
-    Serial.print("[VFD TX]");
-    for (uint8_t i = 0; i < len; i++) {
-        char tmp[4];
-        snprintf(tmp, sizeof(tmp), " %02X", frame[i]);
-        Serial.print(tmp);
+    if (vfd_log_raw) {
+        Serial.print("[VFD TX]");
+        for (uint8_t i = 0; i < len; i++) {
+            char tmp[4];
+            snprintf(tmp, sizeof(tmp), " %02X", frame[i]);
+            Serial.print(tmp);
+        }
+        Serial.println();
     }
-    Serial.println();
 }
 
 /* Read up to max_len bytes with a timeout.  Returns actual byte count received.
@@ -357,16 +364,18 @@ static uint8_t vfd_recv_frame(uint8_t *buf, uint8_t max_len, uint32_t timeout_ms
         }
     }
 
-    if (idx > 0) {
-        Serial.print("[VFD RX]");
-        for (uint8_t i = 0; i < idx; i++) {
-            char tmp[4];
-            snprintf(tmp, sizeof(tmp), " %02X", buf[i]);
-            Serial.print(tmp);
+    if (vfd_log_raw) {
+        if (idx > 0) {
+            Serial.print("[VFD RX]");
+            for (uint8_t i = 0; i < idx; i++) {
+                char tmp[4];
+                snprintf(tmp, sizeof(tmp), " %02X", buf[i]);
+                Serial.print(tmp);
+            }
+            Serial.println();
+        } else {
+            Serial.println("[VFD RX] timeout — no bytes");
         }
-        Serial.println();
-    } else {
-        Serial.println("[VFD RX] timeout — no bytes");
     }
     return idx;
 }
@@ -453,9 +462,11 @@ static bool vfd_read_regs(uint16_t start_reg, uint8_t count, uint16_t *out)
     }
     for (uint8_t i = 0; i < count; i++)
         out[i] = (uint16_t)resp[3 + i * 2] << 8 | resp[4 + i * 2];
-    Serial.printf("[VFD] FC03 reg=0x%04X cnt=%u  OK", start_reg, count);
-    for (uint8_t i = 0; i < count; i++) Serial.printf("  [%u]=0x%04X", i, out[i]);
-    Serial.println();
+    if (vfd_log_raw) {
+        Serial.printf("[VFD] FC03 reg=0x%04X cnt=%u  OK", start_reg, count);
+        for (uint8_t i = 0; i < count; i++) Serial.printf("  [%u]=0x%04X", i, out[i]);
+        Serial.println();
+    }
     return true;
 }
 
@@ -465,30 +476,41 @@ static bool vfd_read_regs(uint16_t start_reg, uint8_t count, uint16_t *out)
 static bool vfd_run()
 {
     Serial.println("[VFD] CMD run-forward");
-    return vfd_write_reg(0x0001, 0x0001);
+    vfd_log_raw = true;
+    bool ok = vfd_write_reg(0x0001, 0x0001);
+    vfd_log_raw = false;
+    return ok;
 }
 
 /* Run reverse */
 static bool vfd_reverse()
 {
     Serial.println("[VFD] CMD run-reverse");
-    return vfd_write_reg(0x0001, 0x0002);
+    vfd_log_raw = true;
+    bool ok = vfd_write_reg(0x0001, 0x0002);
+    vfd_log_raw = false;
+    return ok;
 }
 
 /* Stop (coast / decelerate per drive config) */
 static bool vfd_stop()
 {
     Serial.println("[VFD] CMD stop");
-    return vfd_write_reg(0x0001, 0x0000);
+    vfd_log_raw = true;
+    bool ok = vfd_write_reg(0x0001, 0x0000);
+    vfd_log_raw = false;
+    return ok;
 }
 
 /* Reset active fault — rising edge on bit 3, then clear */
 static bool vfd_reset_fault()
 {
     Serial.println("[VFD] CMD fault-reset");
+    vfd_log_raw = true;
     bool ok = vfd_write_reg(0x0001, 0x0008);
     delay(50);
     ok &= vfd_write_reg(0x0001, 0x0000);
+    vfd_log_raw = false;
     return ok;
 }
 
@@ -500,7 +522,10 @@ static bool vfd_set_freq(uint16_t hz_hundredths)
     vfd_freq_ref = hz_hundredths;
     Serial.printf("[VFD] CMD set-freq %u (%.2f Hz)\n",
                   hz_hundredths, hz_hundredths / 100.0f);
-    return vfd_write_reg(0x0002, hz_hundredths);
+    vfd_log_raw = true;
+    bool ok = vfd_write_reg(0x0002, hz_hundredths);
+    vfd_log_raw = false;
+    return ok;
 }
 
 /* Decode fault code to a short string.  Returns pointer to a string literal. */
@@ -541,12 +566,14 @@ static const char *vfd_fault_name(uint16_t code)
     }
 }
 
-/* Called periodically from loop() — reads status word and fault code.
+/* Called periodically from loop() — reads status word, fault code, and output frequency.
    Shows overlay on new faults or on fault clearance. */
 static void vfd_poll()
 {
-    uint16_t regs[2];
-    bool ok = vfd_read_regs(0x0020, 2, regs);   /* 0x0020 = status, 0x0021 = fault code */
+    /* Read status (0x0020), fault code (0x0021), and output frequency (0x0025).
+       0x0022–0x0024 are contiguous monitor registers — read 6 to get 0x0020–0x0025. */
+    uint16_t regs[6];
+    bool ok = vfd_read_regs(0x0020, 6, regs);
     bool was_ok = vfd_comms_ok;
     vfd_comms_ok = ok;
     if (!ok) {
@@ -554,8 +581,9 @@ static void vfd_poll()
         return;
     }
 
-    uint16_t new_status = regs[0];
-    uint16_t new_fault  = regs[1];
+    uint16_t new_status      = regs[0];   /* 0x0020 */
+    uint16_t new_fault       = regs[1];   /* 0x0021 */
+    uint16_t new_output_freq = regs[5];   /* 0x0025 */
 
     /* Log any change in status word or fault code */
     if (new_status != vfd_status_word || new_fault != vfd_fault_code) {
@@ -578,6 +606,7 @@ static void vfd_poll()
 
     vfd_status_word = new_status;
     vfd_fault_code  = new_fault;
+    vfd_output_freq = new_output_freq;
     vfd_running     = (new_status & 0x0001) != 0;
 }
 
@@ -950,7 +979,7 @@ static const String WEB_PAGE =
     "d.comms_ok?(d.running?'Running':'Stopped'):'No comms';"
     "document.getElementById('vfdStatus').style.color="
     "d.comms_ok?(d.running?'#4ade80':'#aaa'):'#f87171';"
-    "var rpm=Math.round(d.freq*d.base_rpm/d.base_hz);"
+    "var rpm=d.output_freq>0?Math.round(d.output_freq*d.base_rpm/d.base_hz):0;"
     "document.getElementById('vfdRpm').textContent=(d.comms_ok?rpm+' RPM':'-- RPM');"
     "}catch(e){}"
     "},2000);"
@@ -1169,8 +1198,9 @@ static void handle_vfd_rpm()
         return;
     }
     /* Convert RPM → frequency in 0.01 Hz units using the scaling curve:
-       hz = rpm × (vfd_base_hz / vfd_base_rpm) */
-    uint32_t hz_cents = ((uint32_t)rpm_val * vfd_base_hz) / vfd_base_rpm;
+       hz = rpm × (vfd_base_hz / vfd_base_rpm)
+       Use 64-bit intermediate to avoid overflow at high RPM × high base_hz values. */
+    uint32_t hz_cents = (uint32_t)(((uint64_t)rpm_val * vfd_base_hz) / vfd_base_rpm);
     if (hz_cents > 40000) hz_cents = 40000;
     bool ok = vfd_set_freq((uint16_t)hz_cents);
     char buf[48];
@@ -1219,15 +1249,16 @@ static void handle_vfd_settings()
 
 static void handle_vfd_status()
 {
-    char buf[128];
+    char buf[160];
     snprintf(buf, sizeof(buf),
              "{\"comms_ok\":%s,\"running\":%s,\"status\":%u,\"fault\":%u,"
-             "\"freq\":%u,\"base_hz\":%u,\"base_rpm\":%u}",
+             "\"freq\":%u,\"output_freq\":%u,\"base_hz\":%u,\"base_rpm\":%u}",
              vfd_comms_ok ? "true" : "false",
              vfd_running  ? "true" : "false",
              (unsigned)vfd_status_word,
              (unsigned)vfd_fault_code,
              (unsigned)vfd_freq_ref,
+             (unsigned)vfd_output_freq,
              (unsigned)vfd_base_hz,
              (unsigned)vfd_base_rpm);
     server.send(200, "application/json", buf);
@@ -1353,7 +1384,7 @@ static void apply_wifi_config()
 
 /* ---- Persistent config (EEPROM) ----
    Layout (byte offsets):
-     0        : magic byte (0xAF = valid data present)
+     0        : magic byte (0xB0 = valid data present)
      1        : wifi_mode (0 = AP, 1 = STA)
      2–65     : sta_ssid  (null-terminated, max 63 chars)
      66–129   : sta_password (null-terminated, max 63 chars)
