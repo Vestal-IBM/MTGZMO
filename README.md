@@ -1,4 +1,4 @@
-# Machine-Tachometer-Hobbing
+# Machine Tool Gizmo
 
 A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live RPM on a GC9A01 round TFT display using LVGL 8, drives a stepper motor via a TMC5160 at a configurable ratio of the measured RPM, and controls a Yaskawa A1000 VFD over MEMOBUS/Modbus RTU. Designed for hobbing machine synchronisation — the stepper speed tracks the spindle speed according to a user-defined hob thread / gear tooth count.
 
@@ -36,6 +36,11 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - 2 kΩ–100 kΩ potentiometer (GPIO 26 / ADC0) — 10 kΩ recommended
 
 ## Wiring
+
+**Pinout references:**
+- [Raspberry Pi Pico 2W pinout](https://datasheets.raspberrypi.com/picow/pico-2-w-pinout.pdf) (RP2350, used as main controller)
+- [Raspberry Pi Pico pinout](https://datasheets.raspberrypi.com/pico/Pico-R3-A4-Pinout.pdf) (RP2040, used for the A1000 simulator)
+
 
 ### GC9A01 Display → Pico 2W (SPI0)
 
