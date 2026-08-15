@@ -36,11 +36,15 @@ static volatile uint32_t pulley_driven  = 1;   /* Teeth on output-side pulley   
 #define TMC_R_SENSE     0.075f      /* Sense resistor value in ohms */
 #define TMC_RMS_CURRENT 1000        /* Motor RMS current in mA */
 
-#define BTN_PIN         14          /* IP display button — pulled up, active LOW */
-#define VFD_BTN_STARTSTOP  4        /* VFD Start/Stop toggle — pulled up, active LOW */
-#define VFD_BTN_REVERSE    5        /* VFD Reverse — pulled up, active LOW */
+#define BTN_PIN            14       /* IP display button — pulled up, active LOW */
+#define VFD_BTN_START      4        /* VFD Start (run forward) — pulled up, active LOW */
+#define VFD_BTN_REVERSE    5        /* VFD Reverse (run reverse) — pulled up, active LOW */
+#define VFD_BTN_STOP       6        /* VFD Stop — pulled up, active LOW */
+#define RPM_SRC_BTN       16        /* RPM source select — held LOW = VFD, open = encoder */
+#define VFD_LOCK_BTN      22        /* Web VFD control lockout — held LOW = controls disabled */
 #define VFD_POT_PIN       26        /* RPM potentiometer wiper — ADC0 (GPIO 26) */
-#define VFD_POT_DEADBAND   8        /* ADC counts of change required to trigger a write */
+#define VFD_POT_DEADBAND  32        /* ADC counts of change required to trigger a write (~0.5 Hz hysteresis) */
+#define VFD_POT_MIN       100       /* ADC counts at full CCW — maps to 0 Hz (tune if needed) */
 #define MOTOR_STEPS     200         /* Full steps per revolution */
 #define MICROSTEPS      256         /* Microstep resolution */
 
@@ -118,6 +122,8 @@ static lv_obj_t              *meter;
 static lv_meter_indicator_t  *needle;
 static lv_obj_t              *rpm_label;
 static lv_obj_t              *rpm_readout;
+static lv_obj_t              *arrow_fwd;      /* right-arrow: VFD forward indicator  */
+static lv_obj_t              *arrow_rev;      /* left-arrow:  VFD reverse indicator  */
 static lv_obj_t              *ip_overlay;     /* IP address pop-up label */
 
 /* ---- LVGL flush callback ---- */
@@ -237,6 +243,21 @@ static void create_tachometer(void)
     lv_obj_set_style_text_font(rpm_readout, &lv_font_unscii_16, LV_PART_MAIN);
     lv_obj_center(rpm_readout);
 
+    /* Direction arrows — flanking the RPM readout box.
+       Right arrow (▶) = forward, left arrow (◀) = reverse.
+       Both start dim; update_direction_arrows() lights the active one green. */
+    arrow_fwd = lv_label_create(lv_scr_act());
+    lv_label_set_text(arrow_fwd, LV_SYMBOL_RIGHT LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(arrow_fwd, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+    lv_obj_set_style_text_font(arrow_fwd, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_align(arrow_fwd, LV_ALIGN_CENTER, 62, 0);   /* right of centre */
+
+    arrow_rev = lv_label_create(lv_scr_act());
+    lv_label_set_text(arrow_rev, LV_SYMBOL_LEFT LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(arrow_rev, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+    lv_obj_set_style_text_font(arrow_rev, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_align(arrow_rev, LV_ALIGN_CENTER, -62, 0);  /* left of centre */
+
     /* IP address overlay — dark pill centred on screen, hidden until button press */
     lv_obj_t *ip_box = lv_obj_create(lv_scr_act());
     lv_obj_set_size(ip_box, 210, 54);
@@ -261,6 +282,27 @@ static void create_tachometer(void)
 
 /* ---- Show overlay notification ---- */
 static void show_overlay(const char *text, uint32_t duration_ms);   /* forward decl */
+
+/* Update the direction arrow colours based on current VFD state.
+   Active + running  → bright green
+   Active + stopped  → dim green  (shows selected direction at a glance)
+   Inactive          → near-black (invisible against dark background)   */
+static void update_direction_arrows()
+{
+    /* Forward arrow */
+    lv_color_t fwd_col;
+    if (!vfd_reverse_active && vfd_running)   fwd_col = lv_color_hex(0x00CC44);  /* bright green */
+    else if (!vfd_reverse_active)             fwd_col = lv_color_hex(0xCCAA00);  /* yellow */
+    else                                      fwd_col = lv_color_hex(0x2A2A2A);  /* off */
+    lv_obj_set_style_text_color(arrow_fwd, fwd_col, LV_PART_MAIN);
+
+    /* Reverse arrow */
+    lv_color_t rev_col;
+    if (vfd_reverse_active && vfd_running)    rev_col = lv_color_hex(0x00CC44);  /* bright green */
+    else if (vfd_reverse_active)              rev_col = lv_color_hex(0xCCAA00);  /* yellow */
+    else                                      rev_col = lv_color_hex(0x2A2A2A);  /* off */
+    lv_obj_set_style_text_color(arrow_rev, rev_col, LV_PART_MAIN);
+}
 
 /* ==========================================================================
    STEPPER DRIVER ABSTRACTION — TMC5160 implementation
@@ -483,7 +525,7 @@ static bool vfd_run()
     vfd_log_raw = true;
     bool ok = vfd_write_reg(0x0001, 0x0001);
     vfd_log_raw = false;
-    if (ok) vfd_running = true;   /* optimistic update — poll will correct if wrong */
+    if (ok) vfd_running = true;
     return ok;
 }
 
@@ -495,6 +537,40 @@ static bool vfd_reverse()
     bool ok = vfd_write_reg(0x0001, 0x0002);
     vfd_log_raw = false;
     if (ok) vfd_running = true;
+    return ok;
+}
+
+/* Start sequence:
+   1. Send run-forward at freq=0 to put drive in running state
+   2. Poll drive to read actual direction state from status word
+   3. Send correct direction command
+   4. Restore current frequency setpoint */
+static bool vfd_start()
+{
+    Serial.println("[VFD] CMD start");
+    vfd_log_raw = true;
+
+    /* Step 1: enter running state at zero speed */
+    if (!vfd_write_reg(0x0002, 0x0000)) { vfd_log_raw = false; return false; }  /* freq = 0 */
+    if (!vfd_write_reg(0x0001, 0x0001)) { vfd_log_raw = false; return false; }  /* run fwd */
+    vfd_running = true;
+
+    /* Step 2: poll actual direction from drive status word */
+    uint16_t regs[1];
+    if (vfd_read_regs(0x0020, 1, regs)) {
+        vfd_status_word = regs[0];
+        vfd_reverse_active = (vfd_status_word & 0x0004) != 0;
+        Serial.printf("[VFD] start — drive status=0x%04X reverse=%d\n",
+                      vfd_status_word, vfd_reverse_active);
+    }
+
+    /* Step 3: send correct direction */
+    uint16_t dir_cmd = vfd_reverse_active ? 0x0002 : 0x0001;
+    if (!vfd_write_reg(0x0001, dir_cmd)) { vfd_log_raw = false; return false; }
+
+    /* Step 4: restore frequency setpoint */
+    bool ok = vfd_write_reg(0x0002, vfd_freq_ref);
+    vfd_log_raw = false;
     return ok;
 }
 
@@ -614,7 +690,12 @@ static void vfd_poll()
     vfd_status_word = new_status;
     vfd_fault_code  = new_fault;
     vfd_output_freq = new_output_freq;
-    vfd_running     = (new_status & 0x0001) != 0;
+    vfd_running     = (new_status & 0x0001) != 0;     /* bit 0: During Run */
+    /* Sync intended direction from drive only while running — when stopped the
+       drive reports bit 2 = 0 regardless, so we preserve vfd_reverse_active
+       so Start correctly resumes in the last-running direction. */
+    if (vfd_running)
+        vfd_reverse_active = (new_status & 0x0004) != 0;  /* bit 2: Reverse Running */
 }
 
 /* Initialise UART and the DE pin.  Called once from setup().
@@ -768,34 +849,38 @@ static const String WEB_PAGE =
     "<h2>VFD — Yaskawa A1000</h2>"
     "<label>Status</label>"
     "<div id='vfdStatus' style='font-size:1.1rem;font-weight:600;color:#aaa'>--</div>"
-    "<label style='margin-top:4px'>Output speed</label>"
+    "<label style='margin-top:4px'>VFD Speed</label>"
     "<div id='vfdRpm' style='font-size:1.1rem;color:#aaa'>-- RPM</div>"
-    "<label style='margin-top:4px'>Speed setpoint (RPM)</label>"
-    "<div style='display:flex;gap:8px;margin-top:6px'>"
+    "<label style='margin-top:4px'>Set Speed</label>"
+    "<div id='vfdSetpoint' style='font-size:1.1rem;color:#aaa'>-- RPM</div>"
+    "<label style='margin-top:4px'>Speed Setting (RPM)</label>"
+    "<div id='vfdRpmRow' style='display:flex;gap:8px;margin-top:6px'>"
     "<input type='number' id='vfdRpmIn' min='0' step='1'"
     " placeholder='e.g. 1750' style='flex:1'>"
-    "<button type='button' onclick='vfdSetRpm()'"
+    "<button type='button' onclick='vfdSetRpm()' id='vfdRpmBtn'"
     " style='padding:0 14px;background:#2a2a2a;border:1px solid #444;"
     "border-radius:6px;color:#ccc;cursor:pointer;font-size:.9rem;"
     "white-space:nowrap'>Set RPM</button>"
     "</div>"
-    "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>"
+    "<div id='vfdCtrlBtns' style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>"
     "<button type='button' onclick='vfdCmd(\"/vfd-run\")'"
     " style='padding:10px;background:#166534;border:none;"
     "border-radius:6px;color:#fff;font-size:.9rem;font-weight:600;"
-    "cursor:pointer'>Run ▶</button>"
+    "cursor:pointer'>\u25b6 Forward</button>"
     "<button type='button' onclick='vfdCmd(\"/vfd-reverse\")'"
-    " style='padding:10px;background:#1e3a5f;border:none;"
+    " style='padding:10px;background:#166534;border:none;"
     "border-radius:6px;color:#fff;font-size:.9rem;font-weight:600;"
-    "cursor:pointer'>◀ Reverse</button>"
+    "cursor:pointer'>\u25c0 Reverse</button>"
     "<button type='button' onclick='vfdCmd(\"/vfd-stop\")'"
     " style='padding:10px;background:#7f1d1d;border:none;"
     "border-radius:6px;color:#fff;font-size:.9rem;font-weight:600;"
-    "cursor:pointer'>Stop ■</button>"
+    "cursor:pointer'>Stop \u25a0</button>"
     "<button type='button' onclick='vfdCmd(\"/vfd-reset\")'"
     " style='padding:10px;background:#2a2a2a;border:1px solid #444;"
     "border-radius:6px;color:#ccc;font-size:.9rem;cursor:pointer'>Reset</button>"
     "</div>"
+    "<div id='vfdLockNote' style='display:none;font-size:.8rem;color:#888;"
+    "margin-top:4px'>Controls locked by hardware switch</div>"
     "<div class='msg' id='msgVfd'></div>"
     "</div>"
     "</div>"
@@ -860,8 +945,19 @@ static const String WEB_PAGE =
     "<option value='sta' __STASEL__>Station (connect to router)</option>"
     "</select>"
     "<div id='staFields' style='margin-top:10px;flex-direction:column;gap:10px'>"
-    "<div><label for='wssid'>SSID</label>"
-    "<input type='text' id='wssid' name='ssid' placeholder='Network name' style='margin-top:4px'></div>"
+    "<div>"
+    "<div style='display:flex;justify-content:space-between;align-items:center'>"
+    "<label>SSID</label>"
+    "<button type='button' onclick='scanWifi()' id='btnScan'"
+    " style='padding:2px 10px;background:#2a2a2a;border:1px solid #444;border-radius:6px;"
+    "color:#ccc;cursor:pointer;font-size:.8rem;white-space:nowrap'>Scan</button>"
+    "</div>"
+    "<select id='ssidSelect' style='margin-top:4px;width:100%' onchange='document.getElementById(\"wssid\").value=this.value'>"
+    "<option value=''>-- select network --</option>"
+    "</select>"
+    "<input type='text' id='wssid' name='ssid'"
+    " placeholder='Or type network name' style='margin-top:6px'>"
+    "</div>"
     "<div><label for='wpass'>Password</label>"
     "<div style='display:flex;gap:8px;margin-top:4px'>"
     "<input type='password' id='wpass' name='pass' placeholder='Password' style='flex:1'>"
@@ -936,8 +1032,28 @@ static const String WEB_PAGE =
     "function toggleSTA(){"
     "var m=document.getElementById('wmode').value;"
     "document.getElementById('staFields').style.display=(m==='sta'?'flex':'none');"
+    "if(m==='sta')scanWifi();"
     "}"
     "toggleSTA();"
+    "async function scanWifi(){"
+    "var btn=document.getElementById('btnScan');"
+    "btn.textContent='Scanning...';btn.disabled=true;"
+    "var sel=document.getElementById('ssidSelect');"
+    "sel.innerHTML='<option value=\"\">-- scanning --</option>';"
+    "try{"
+    "var r=await fetch('/wifi-scan');"
+    "var d=await r.json();"
+    "sel.innerHTML='<option value=\"\">-- select network --</option>';"
+    "if(d.length===0){"
+    "sel.innerHTML='<option value=\"\">No networks found</option>';}"
+    "else{"
+    "d.forEach(function(s){"
+    "var o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o);"
+    "});}"
+    "}catch(e){"
+    "sel.innerHTML='<option value=\"\">Scan failed</option>';}"
+    "btn.textContent='Scan';btn.disabled=false;"
+    "}"
     /* password reveal */
     "function togglePw(){"
     "var inp=document.getElementById('wpass');"
@@ -974,7 +1090,7 @@ static const String WEB_PAGE =
     "el.textContent=txt;el.className=err?'msg err':'msg';"
     "setTimeout(function(){el.textContent='';},4000);"
     "}"
-    /* VFD status poll (every 2 s while on Home tab) */
+    /* VFD status poll (every 500 ms while on Home tab) */
     "var vfdPollTimer=null;"
     "function startVfdPoll(){"
     "if(vfdPollTimer)return;"
@@ -982,14 +1098,28 @@ static const String WEB_PAGE =
     "try{"
     "var r=await fetch('/vfd-status');"
     "var d=await r.json();"
-    "document.getElementById('vfdStatus').textContent="
-    "d.comms_ok?(d.running?'Running':'Stopped'):'No comms';"
+    "var statusTxt='No comms';"
+    "if(d.comms_ok){"
+    "if(d.running)statusTxt=d.reverse?'\u25c0 Running Reverse':'Running Forward \u25b6';"
+    "else statusTxt='Stopped';"
+    "}"
+    "document.getElementById('vfdStatus').textContent=statusTxt;"
     "document.getElementById('vfdStatus').style.color="
     "d.comms_ok?(d.running?'#4ade80':'#aaa'):'#f87171';"
-    "var rpm=d.output_freq>0?Math.round(d.output_freq*d.base_rpm/d.base_hz):0;"
-    "document.getElementById('vfdRpm').textContent=(d.comms_ok?rpm+' RPM':'-- RPM');"
+    "var outRpm=d.output_freq>0?Math.round(d.output_freq*d.base_rpm/d.base_hz):0;"
+    "document.getElementById('vfdRpm').textContent=(d.comms_ok?outRpm+' RPM':'-- RPM');"
+    "var setRpm=d.freq>0?Math.round(d.freq*d.base_rpm/d.base_hz):0;"
+    "document.getElementById('vfdSetpoint').textContent=(d.comms_ok?setRpm+' RPM':'-- RPM');"
+    "var locked=!!d.web_lock;"
+    "document.getElementById('vfdRpmIn').disabled=locked;"
+    "document.getElementById('vfdRpmBtn').disabled=locked;"
+    "document.getElementById('vfdRpmRow').style.opacity=locked?'0.35':'1';"
+    "var btns=document.getElementById('vfdCtrlBtns').querySelectorAll('button');"
+    "btns.forEach(function(b){b.disabled=locked;});"
+    "document.getElementById('vfdCtrlBtns').style.opacity=locked?'0.35':'1';"
+    "document.getElementById('vfdLockNote').style.display=locked?'block':'none';"
     "}catch(e){}"
-    "},2000);"
+    "},500);"
     "}"
     "function stopVfdPoll(){clearInterval(vfdPollTimer);vfdPollTimer=null;}"
     /* patch showPage to start/stop VFD poll */
@@ -999,7 +1129,7 @@ static const String WEB_PAGE =
     "if(p==='home')startVfdPoll();else stopVfdPoll();"
     "};"
     "startVfdPoll();"
-    /* VFD command buttons */
+    /* Simple fire-and-forget VFD command */
     "async function vfdCmd(url){"
     "try{"
     "var r=await fetch(url,{method:'POST'});"
@@ -1153,21 +1283,14 @@ static uint32_t g_ip_show_until = 0;
 
 static void handle_vfd_run()
 {
-    /* Run in whatever direction is currently active — same as physical Start button */
-    bool ok = vfd_reverse_active ? vfd_reverse() : vfd_run();
-    server.send(ok ? 200 : 502, "text/plain", ok ? "Run command sent" : "VFD comms error");
+    bool ok = vfd_run();
+    server.send(ok ? 200 : 502, "text/plain", ok ? "Forward command sent" : "VFD comms error");
 }
 
 static void handle_vfd_reverse()
 {
-    /* Flip direction state. Only send a command if already running — never starts the drive. */
-    vfd_reverse_active = !vfd_reverse_active;
-    if (vfd_running) {
-        bool ok = vfd_reverse_active ? vfd_reverse() : vfd_run();
-        server.send(ok ? 200 : 502, "text/plain", ok ? "Reverse command sent" : "VFD comms error");
-    } else {
-        server.send(200, "text/plain", "Direction set (drive stopped)");
-    }
+    bool ok = vfd_reverse();
+    server.send(ok ? 200 : 502, "text/plain", ok ? "Reverse command sent" : "VFD comms error");
 }
 
 static void handle_vfd_stop()
@@ -1215,12 +1338,30 @@ static void handle_vfd_rpm()
        hz = rpm × (vfd_base_hz / vfd_base_rpm)
        Use 64-bit intermediate to avoid overflow at high RPM × high base_hz values. */
     uint32_t hz_cents = (uint32_t)(((uint64_t)rpm_val * vfd_base_hz) / vfd_base_rpm);
-    if (hz_cents > 40000) hz_cents = 40000;
+
+    /* Cap at the configured max frequency; back-calculate the actual RPM applied. */
+    bool clamped = false;
+    if (hz_cents > vfd_max_hz) {
+        hz_cents = vfd_max_hz;
+        clamped  = true;
+    }
+    int actual_rpm = (int)(((uint64_t)hz_cents * vfd_base_rpm) / vfd_base_hz);
+
     bool ok = vfd_set_freq((uint16_t)hz_cents);
-    char buf[48];
-    snprintf(buf, sizeof(buf), ok ? "Speed set: %d RPM (%.2f Hz)" : "VFD comms error",
-             rpm_val, hz_cents / 100.0f);
-    server.send(ok ? 200 : 502, "text/plain", buf);
+    char buf[80];
+    if (!ok) {
+        snprintf(buf, sizeof(buf), "VFD comms error");
+        server.send(502, "text/plain", buf);
+    } else if (clamped) {
+        snprintf(buf, sizeof(buf),
+                 "Input exceeded max \u2014 speed set to %d RPM (%.2f Hz)",
+                 actual_rpm, hz_cents / 100.0f);
+        server.send(200, "text/plain", buf);
+    } else {
+        snprintf(buf, sizeof(buf), "Speed set: %d RPM (%.2f Hz)",
+                 actual_rpm, hz_cents / 100.0f);
+        server.send(200, "text/plain", buf);
+    }
 }
 
 static void handle_vfd_settings()
@@ -1263,18 +1404,45 @@ static void handle_vfd_settings()
 
 static void handle_vfd_status()
 {
-    char buf[160];
+    /* Do a live read of the status word so reverse/running always reflect
+       the drive's actual state, not the cached values from the last poll. */
+    uint16_t live_regs[6];
+    bool live_ok = vfd_read_regs(0x0020, 6, live_regs);
+    if (live_ok) {
+        vfd_status_word = live_regs[0];
+        vfd_fault_code  = live_regs[1];
+        vfd_output_freq = live_regs[5];
+        vfd_running        = (vfd_status_word & 0x0001) != 0;
+        if (vfd_running)
+            vfd_reverse_active = (vfd_status_word & 0x0004) != 0;
+        vfd_comms_ok = true;
+    } else {
+        vfd_comms_ok = false;
+    }
+
+    /* Pot is considered active if the ADC reads meaningfully above zero,
+       meaning a potentiometer is wired to the pin and controlling speed. */
+    bool pot_active = (analogRead(VFD_POT_PIN) > 50);
+
+    /* Lockout button: LOW = web VFD controls disabled */
+    bool web_lock = (digitalRead(VFD_LOCK_BTN) == LOW);
+
+    char buf[240];
     snprintf(buf, sizeof(buf),
-             "{\"comms_ok\":%s,\"running\":%s,\"status\":%u,\"fault\":%u,"
-             "\"freq\":%u,\"output_freq\":%u,\"base_hz\":%u,\"base_rpm\":%u}",
-             vfd_comms_ok ? "true" : "false",
-             vfd_running  ? "true" : "false",
+             "{\"comms_ok\":%s,\"running\":%s,\"reverse\":%s,\"status\":%u,\"fault\":%u,"
+             "\"freq\":%u,\"output_freq\":%u,\"base_hz\":%u,\"base_rpm\":%u,"
+             "\"pot_active\":%s,\"web_lock\":%s}",
+             vfd_comms_ok       ? "true" : "false",
+             vfd_running        ? "true" : "false",
+             vfd_reverse_active ? "true" : "false",
              (unsigned)vfd_status_word,
              (unsigned)vfd_fault_code,
              (unsigned)vfd_freq_ref,
              (unsigned)vfd_output_freq,
              (unsigned)vfd_base_hz,
-             (unsigned)vfd_base_rpm);
+             (unsigned)vfd_base_rpm,
+             pot_active         ? "true" : "false",
+             web_lock           ? "true" : "false");
     server.send(200, "application/json", buf);
 }
 
@@ -1286,6 +1454,30 @@ static void show_overlay(const char *text, uint32_t duration_ms)
     lv_obj_t *box = lv_obj_get_parent(ip_overlay);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_HIDDEN);
     g_ip_show_until = duration_ms ? (millis() + duration_ms) : 0;
+}
+
+static void handle_wifi_scan()
+{
+    /* In AP-only mode the radio can't scan; switch to AP+STA for the duration. */
+    bool was_ap_only = (wifi_mode == MODE_AP);
+    if (was_ap_only) WiFi.mode(WIFI_AP_STA);
+
+    int n = WiFi.scanNetworks();   /* blocking scan — typically 2–4 s */
+
+    if (was_ap_only) WiFi.mode(WIFI_AP);   /* restore */
+
+    String json = "[";
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            if (i > 0) json += ",";
+            String ssid = WiFi.SSID(i);
+            ssid.replace("\"", "\\\"");
+            json += "\"" + ssid + "\"";
+        }
+    }
+    json += "]";
+    WiFi.scanDelete();
+    server.send(200, "application/json", json);
 }
 
 static void handle_set_wifi()
@@ -1369,7 +1561,7 @@ static void apply_wifi_config()
             WiFi.softAPConfig(local, local, IPAddress(255, 255, 255, 0));
             WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
             current_ip = "192.168.4.1";
-            dnsServer.start(53, WIFI_HOSTNAME, local);
+            dnsServer.start(53, "*", local);
             server.begin();
             return;   /* return early — don't save, preserving STA config */
         }
@@ -1384,7 +1576,7 @@ static void apply_wifi_config()
         WiFi.softAPConfig(local, local, IPAddress(255, 255, 255, 0));
         WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
         current_ip = "192.168.4.1";
-        dnsServer.start(53, WIFI_HOSTNAME, local);
+        dnsServer.start(53, "*", local);
 
         /* duration_ms=0 → stays visible until explicitly hidden or overwritten;
            the overlay will be on screen when loop() starts and cleared on next button press */
@@ -1569,6 +1761,7 @@ static void setup_wifi()
     server.on("/set-ppr",      HTTP_POST, handle_set_ppr);
     server.on("/set-pulley",   HTTP_POST, handle_set_pulley);
     server.on("/set-wifi",     HTTP_GET,  handle_set_wifi);
+    server.on("/wifi-scan",    HTTP_GET,  handle_wifi_scan);
     server.on("/vfd-rpm",      HTTP_POST, handle_vfd_rpm);
     server.on("/vfd-run",      HTTP_POST, handle_vfd_run);
     server.on("/vfd-reverse",  HTTP_POST, handle_vfd_reverse);
@@ -1577,6 +1770,11 @@ static void setup_wifi()
     server.on("/vfd-freq",     HTTP_POST, handle_vfd_freq);
     server.on("/vfd-settings", HTTP_POST, handle_vfd_settings);
     server.on("/vfd-status",   HTTP_GET,  handle_vfd_status);
+    /* Captive portal: redirect any unrecognised URL to the root page */
+    server.onNotFound([]() {
+        server.sendHeader("Location", "/", true);
+        server.send(302, "text/plain", "");
+    });
     apply_wifi_config();
 }
 
@@ -1595,9 +1793,15 @@ void setup()
     pinMode(BTN_PIN, INPUT_PULLUP);
 
     /* VFD physical controls */
-    pinMode(VFD_BTN_STARTSTOP, INPUT_PULLUP);
-    pinMode(VFD_BTN_REVERSE,   INPUT_PULLUP);
-    pinMode(VFD_POT_PIN,       INPUT);   /* ADC — no pullup */
+    pinMode(VFD_BTN_START,   INPUT_PULLUP);
+    pinMode(VFD_BTN_REVERSE, INPUT_PULLUP);
+    pinMode(VFD_BTN_STOP,    INPUT_PULLUP);
+    pinMode(VFD_POT_PIN,     INPUT);   /* ADC — no pullup */
+    analogReadResolution(12);          /* Force 12-bit ADC (0–4095); default is 10-bit */
+
+    /* RPM source select button */
+    pinMode(RPM_SRC_BTN,  INPUT_PULLUP);
+    pinMode(VFD_LOCK_BTN, INPUT_PULLUP);
 
     /* Initialise display */
     tft.begin();
@@ -1681,76 +1885,85 @@ void loop()
         g_ip_show_until = 0;
     }
 
+    /* ---- RPM source select ---- */
+    bool vfd_rpm_source = (digitalRead(RPM_SRC_BTN) == LOW);
+
     static uint32_t last_rpm_ms  = 0;
     static int32_t  last_pos     = 0;
-    static int32_t  smooth_rpm   = 0;   /* signed, exponentially smoothed RPM */
+    static int32_t  smooth_rpm   = 0;   /* signed, exponentially smoothed RPM (encoder) */
+    static bool     last_vfd_src = false;
 
     if (now - last_rpm_ms >= RPM_UPDATE_MS)
     {
-        /* Snapshot encoder position atomically */
+        last_rpm_ms = now;
+
+        /* Always keep the encoder state current so stepper tracking stays accurate */
         noInterrupts();
         int32_t current_pos = encoder_pos;
         interrupts();
 
         int32_t delta   = current_pos - last_pos;
         last_pos        = current_pos;
-        last_rpm_ms     = now;
 
-        /* Signed RPM = (Δpulses × 60000) / (PPR × interval_ms) */
         int32_t raw_rpm = (delta * 60000L) / ((int32_t)encoder_ppr * RPM_UPDATE_MS);
         if (raw_rpm >  (int32_t)METER_MAX_RPM) raw_rpm =  (int32_t)METER_MAX_RPM;
         if (raw_rpm < -(int32_t)METER_MAX_RPM) raw_rpm = -(int32_t)METER_MAX_RPM;
 
-        /* Exponential smoothing (signed) */
         smooth_rpm = (smooth_rpm * 6 + raw_rpm * 4) / 10;
 
-        /* Drive stepper — direction follows sign of smooth_rpm */
+        /* Stepper always tracks encoder regardless of display source */
         set_stepper_rpm(smooth_rpm);
 
-        /* Gauge and readout show absolute speed */
-        uint32_t abs_rpm = (uint32_t)abs(smooth_rpm);
+        /* Choose display RPM based on source button */
+        uint32_t display_rpm;
+        if (vfd_rpm_source) {
+            /* VFD source: convert output_freq (0.01 Hz units) → RPM */
+            display_rpm = (vfd_base_hz > 0)
+                ? (uint32_t)(((uint32_t)vfd_output_freq * vfd_base_rpm) / vfd_base_hz)
+                : 0;
+        } else {
+            display_rpm = (uint32_t)abs(smooth_rpm);
+        }
+        if (display_rpm > METER_MAX_RPM) display_rpm = METER_MAX_RPM;
+
+        /* Show source label when it changes */
+        if (vfd_rpm_source != last_vfd_src) {
+            show_overlay(vfd_rpm_source ? "RPM: VFD" : "RPM: Encoder", 2000);
+            last_vfd_src = vfd_rpm_source;
+        }
 
         /* Scale needle to 0–400 range (scale units = RPM / 10) */
-        lv_meter_set_indicator_end_value(meter, needle, (int32_t)(abs_rpm / 10));
+        lv_meter_set_indicator_end_value(meter, needle, (int32_t)(display_rpm / 10));
 
         /* Update live RPM readout */
         char buf[8];
-        snprintf(buf, sizeof(buf), "%04lu", abs_rpm);
+        snprintf(buf, sizeof(buf), "%04lu", display_rpm);
         lv_label_set_text(rpm_readout, buf);
     }
 
     lv_timer_handler();
 
-    /* ---- VFD physical controls ---- */
+    /* ---- VFD physical controls — each button sends exactly one command ---- */
 
-    /* Start/Stop button — edge-triggered toggle.
-       Starts in whatever direction was last commanded; does not change direction. */
-    static bool vfd_ss_last = HIGH;
-    bool vfd_ss_now = digitalRead(VFD_BTN_STARTSTOP);
-    if (vfd_ss_last == HIGH && vfd_ss_now == LOW) {
-        if (vfd_running) {
-            vfd_stop();
-        } else {
-            if (vfd_reverse_active) vfd_reverse();
-            else                    vfd_run();
-        }
-    }
-    vfd_ss_last = vfd_ss_now;
+    /* Start — always sends run forward */
+    static bool vfd_start_last = HIGH;
+    bool vfd_start_now = digitalRead(VFD_BTN_START);
+    if (vfd_start_last == HIGH && vfd_start_now == LOW) vfd_run();
+    vfd_start_last = vfd_start_now;
 
-    /* Reverse button — flips direction state only.
-       If already running, sends the new direction command immediately.
-       If stopped, just updates direction for the next Start press — never starts the drive. */
+    /* Reverse — always sends run reverse */
     static bool vfd_rev_last = HIGH;
     bool vfd_rev_now = digitalRead(VFD_BTN_REVERSE);
-    if (vfd_rev_last == HIGH && vfd_rev_now == LOW) {
-        vfd_reverse_active = !vfd_reverse_active;
-        if (vfd_running) {
-            if (vfd_reverse_active) vfd_reverse();
-            else                    vfd_run();
-        }
-        /* if stopped: direction is remembered, no command sent */
-    }
+    if (vfd_rev_last == HIGH && vfd_rev_now == LOW) vfd_reverse();
     vfd_rev_last = vfd_rev_now;
+
+    /* Stop — always sends stop */
+    static bool vfd_stop_last = HIGH;
+    bool vfd_stop_now = digitalRead(VFD_BTN_STOP);
+    if (vfd_stop_last == HIGH && vfd_stop_now == LOW) vfd_stop();
+    vfd_stop_last = vfd_stop_now;
+
+    update_direction_arrows();
 
     /* Potentiometer — read ADC, map to RPM, send on meaningful change */
     static uint32_t last_pot_ms  = 0;
@@ -1760,8 +1973,12 @@ void loop()
         int32_t raw = analogRead(VFD_POT_PIN);   /* 0–4095 (12-bit) */
         if (abs(raw - last_pot_raw) > VFD_POT_DEADBAND) {
             last_pot_raw = raw;
-            /* Map 0–4095 → 0–vfd_max_hz (0.01 Hz units) */
-            uint32_t hz_cents = ((uint32_t)raw * vfd_max_hz) / 4095;
+            /* Map POT_MIN–4095 → 0–vfd_max_hz, clamping below min to zero */
+            uint32_t hz_cents = 0;
+            if (raw > VFD_POT_MIN) {
+                hz_cents = ((uint32_t)(raw - VFD_POT_MIN) * vfd_max_hz)
+                           / (4095 - VFD_POT_MIN);
+            }
             vfd_set_freq((uint16_t)hz_cents);
         }
     }
@@ -1771,6 +1988,7 @@ void loop()
     if (now - last_vfd_ms >= VFD_POLL_MS) {
         last_vfd_ms = now;
         vfd_poll();
+        update_direction_arrows();
     }
 
     /* ---- Onboard LED: 1 Hz when VFD running, 0.25 Hz when stopped ---- */

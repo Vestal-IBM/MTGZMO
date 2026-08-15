@@ -39,7 +39,9 @@
 static uint16_t sim_freq_ref    = 0;      /* last written frequency reference (0.01 Hz) */
 static uint16_t sim_output_freq = 0;      /* tracks freq_ref when running */
 static bool     sim_running     = false;
-static bool     sim_reverse     = false;
+static bool     sim_reverse     = false;  /* current active direction */
+static bool     sim_rev_pending = false;  /* direction requested while running — applied after ramp to 0 */
+static bool     sim_dir_change  = false;  /* true when ramping to 0 before a direction flip */
 static uint16_t sim_fault_code  = 0;      /* 0 = no fault */
 
 /* ---- Helpers ---- */
@@ -142,17 +144,34 @@ static bool write_register(uint16_t addr, uint16_t value)
             bool reset = (value & 0x0008) != 0;
 
             if (reset) {
-                sim_fault_code = 0;
-                sim_running    = false;
+                sim_fault_code  = 0;
+                sim_running     = false;
+                sim_dir_change  = false;
+                sim_output_freq = 0;
             }
             if (fwd && !rev) {
-                sim_running = true;
-                sim_reverse = false;
+                if (sim_running && sim_reverse) {
+                    /* Direction change while running — ramp to 0 first */
+                    sim_rev_pending = false;
+                    sim_dir_change  = true;
+                } else {
+                    sim_running    = true;
+                    sim_reverse    = false;
+                    sim_dir_change = false;
+                }
             } else if (rev && !fwd) {
-                sim_running = true;
-                sim_reverse = true;
+                if (sim_running && !sim_reverse) {
+                    /* Direction change while running — ramp to 0 first */
+                    sim_rev_pending = true;
+                    sim_dir_change  = true;
+                } else {
+                    sim_running    = true;
+                    sim_reverse    = true;
+                    sim_dir_change = false;
+                }
             } else if (!fwd && !rev && !reset) {
-                sim_running = false;
+                sim_running    = false;
+                sim_dir_change = false;
             }
             return true;
         }
@@ -282,26 +301,43 @@ static void receive_byte(uint8_t b)
 }
 
 /* ---- Drive simulation: output frequency ramps toward freq_ref ---- */
-/* Called every 50 ms — simulates the drive accelerating/decelerating */
-#define RAMP_STEP 50    /* 0.01 Hz units per 50 ms tick ≈ 0.5 Hz/s */
+/* Called every 50 ms.
+   Accel: 3 s from 0 → 60 Hz  = 20 Hz/s  = 2000 units/s = 100 units/tick
+   Decel: 2 s from 60 Hz → 0  = 30 Hz/s  = 3000 units/s = 150 units/tick */
+#define RAMP_ACCEL 100   /* 0.01 Hz units per 50 ms tick — 20 Hz/s */
+#define RAMP_DECEL 150   /* 0.01 Hz units per 50 ms tick — 30 Hz/s */
 
 static void update_drive()
 {
     if (!sim_running) {
-        /* Decelerating to stop */
-        if (sim_output_freq > RAMP_STEP)
-            sim_output_freq -= RAMP_STEP;
+        /* Commanded stop — decelerate to 0 */
+        if (sim_output_freq > RAMP_DECEL)
+            sim_output_freq -= RAMP_DECEL;
         else
             sim_output_freq = 0;
-    } else {
-        /* Accelerate / decelerate toward freq_ref */
-        if (sim_output_freq < sim_freq_ref) {
-            uint16_t step = min((uint32_t)RAMP_STEP, (uint32_t)(sim_freq_ref - sim_output_freq));
-            sim_output_freq += step;
-        } else if (sim_output_freq > sim_freq_ref) {
-            uint16_t step = min((uint32_t)RAMP_STEP, (uint32_t)(sim_output_freq - sim_freq_ref));
-            sim_output_freq -= step;
+        return;
+    }
+
+    if (sim_dir_change) {
+        /* Mid-direction-change: ramp output to 0 before flipping direction */
+        if (sim_output_freq > RAMP_DECEL) {
+            sim_output_freq -= RAMP_DECEL;
+        } else {
+            /* Reached 0 — flip direction and start ramping up */
+            sim_output_freq = 0;
+            sim_reverse     = sim_rev_pending;
+            sim_dir_change  = false;
         }
+        return;
+    }
+
+    /* Normal run — ramp toward freq_ref */
+    if (sim_output_freq < sim_freq_ref) {
+        uint16_t step = min((uint32_t)RAMP_ACCEL, (uint32_t)(sim_freq_ref - sim_output_freq));
+        sim_output_freq += step;
+    } else if (sim_output_freq > sim_freq_ref) {
+        uint16_t step = min((uint32_t)RAMP_DECEL, (uint32_t)(sim_output_freq - sim_freq_ref));
+        sim_output_freq -= step;
     }
 }
 
