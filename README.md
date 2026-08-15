@@ -1,6 +1,6 @@
 # Machine-Tachometer-Hobbing
 
-A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live RPM on a GC9A01 round TFT display using LVGL 8, and drives a stepper motor via a TMC5160 at a configurable ratio of the measured RPM. Designed for hobbing machine synchronisation — the stepper speed tracks the spindle speed according to a user-defined hob thread / gear tooth count.
+A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live RPM on a GC9A01 round TFT display using LVGL 8, drives a stepper motor via a TMC5160 at a configurable ratio of the measured RPM, and controls a Yaskawa A1000 VFD over MEMOBUS/Modbus RTU. Designed for hobbing machine synchronisation — the stepper speed tracks the spindle speed according to a user-defined hob thread / gear tooth count.
 
 ## Features
 
@@ -9,11 +9,13 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - Exponentially smoothed RPM reading from a quadrature encoder (direction-aware)
 - TMC5160 stepper driver in StealthChop velocity mode — speed tracks encoder RPM via hob/gear ratio, corrected for belt/pulley gearing
 - Stepper driver abstraction — swap to a different driver by replacing two functions only
+- Yaskawa A1000 VFD control over MEMOBUS/Modbus RTU (RS-485): run, stop, set frequency, fault reset
+- VFD fault monitoring — on-screen overlay on any new trip, and on fault clearance
 - WiFi web UI at **`http://gizmo.mt`** (AP mode) to adjust all parameters at runtime
 - AP mode SSID `MTGizmo` — no router needed; DNS resolves `gizmo.mt`
 - Station mode support with automatic fallback to AP if connection fails
 - Physical button (GPIO 14): short press shows current IP on display for 5 s, long press (2 s) forces AP mode
-- On-screen overlay notifications for all WiFi mode transitions
+- On-screen overlay notifications for all WiFi mode transitions and VFD faults
 - All runtime settings persist across reboots via EEPROM
 
 ## Hardware
@@ -24,6 +26,8 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - BigTreeTech TMC5160 v1.2 stepper driver
 - 2-phase stepper motor
 - External motor PSU (8–40 V)
+- SparkFun RS-485 Breakout (or any MAX485-compatible half-duplex transceiver)
+- Yaskawa A1000 VFD
 - Momentary push button (GPIO 14 to GND)
 
 ## Wiring
@@ -72,6 +76,27 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 
 Connect your 2-phase stepper motor coils to the **A1/A2** and **B1/B2** terminals on the TMC5160 board.
 
+### SparkFun RS-485 Breakout → Pico 2W (UART1)
+
+| RS-485 Breakout Pin | Pico 2W GPIO | Pico 2W Pin |
+|---|---|---|
+| TX-O | GPIO 9 (UART1 RX) | Pin 12 |
+| RX-I | GPIO 8 (UART1 TX) | Pin 11 |
+| DE | GPIO 7 | Pin 10 |
+| VCC | 3.3 V | Pin 36 |
+| GND | GND | Any GND |
+
+> DE is driven HIGH to transmit and LOW to receive. The firmware handles this automatically around every Modbus transaction.
+
+### RS-485 → Yaskawa A1000 VFD
+
+| RS-485 Breakout Pin | A1000 Terminal |
+|---|---|
+| A (+) | S+ (R+) |
+| B (−) | S− (R−) |
+
+> Terminate with a 120 Ω resistor across A/B at the far end of the cable if the bus is long or noisy.
+
 ### Button → Pico 2W
 
 | Button Pin | Pico 2W GPIO | Pico 2W Pin |
@@ -103,6 +128,10 @@ Runtime-adjustable settings (survive reboot via EEPROM):
 | Encoder PPR | `600` | Encoder pulses per revolution (single channel) |
 | Encoder reversed | `false` | Flip encoder direction without rewiring |
 | Stepper driver pulley | `1 : 1` | Driver and driven pulley tooth counts for belt correction |
+| VFD slave address | `1` | A1000 Modbus slave address (matches H5-01) |
+| VFD max frequency | `60.00 Hz` | Upper clamp on any speed setpoint sent to the drive |
+| VFD baseline frequency | `60.00 Hz` | Drive output frequency that corresponds to baseline RPM |
+| VFD baseline RPM | `1750` | Motor shaft RPM at the baseline frequency |
 | WiFi mode | AP | AP or Station |
 | Station SSID / password | — | Router credentials for Station mode |
 
@@ -150,6 +179,42 @@ Set both to `1` (default) when the stepper drives the output directly with no be
 | 1 | 32 | 20 | 40 | Belt 1:2 reduction — stepper spins at 2× output RPM |
 | 1 | 32 | 40 | 20 | Belt 2:1 step-up — stepper spins at 0.5× output RPM |
 
+## VFD Control (Yaskawa A1000)
+
+The firmware acts as a Modbus RTU master on UART1 at 9600 bps, 8-N-2. The A1000 is polled every 500 ms to read the status word (register `0x0020`) and fault code (`0x0021`).
+
+### A1000 setup
+
+Set these parameters on the A1000 before connecting:
+
+| Parameter | Value | Description |
+|---|---|---|
+| H5-01 | 1 | Slave address — must match web UI VFD Settings |
+| H5-02 | 3 | Baud rate = 9600 bps |
+| H5-03 | 0 | Data format = 8-N-2 |
+| b1-01 | 2 | Frequency reference source = Modbus |
+| b1-02 | 2 | Run command source = Modbus |
+
+### Fault notifications
+
+When a new fault is detected the fault name is shown on the display overlay for 6 s. When the fault clears, "VFD Fault Cleared" is shown for 3 s. Common faults decoded on-device:
+
+| Code | Name |
+|---|---|
+| 0x01 | oC — Overcurrent |
+| 0x02 | ov — Overvoltage |
+| 0x03 | oH1 — Heatsink overheat |
+| 0x05 | oL1 — Motor overload |
+| 0x06 | oL2 — Drive overload |
+| 0x0B | EF — External fault |
+| 0x0C | EF0 — Modbus-triggered fault |
+| 0x11 | LF — Output phase loss |
+| 0x17 | CE — Modbus communication error |
+| 0x1F | UV1 — DC bus undervoltage |
+| 0x23 | CPF — Control circuit fault |
+
+See [`src/a1000_modbus.json`](src/a1000_modbus.json) for the complete register map and fault code list.
+
 ## Web UI
 
 Connect to the `MTGizmo` WiFi network (password: `hobbing1`) and open **`http://gizmo.mt`** in any browser.
@@ -166,12 +231,14 @@ The UI has two tabs:
 ### Home tab
 
 - **Gear Ratio** card — enter *Threads on hob* and *Gear teeth*; the display shows the current ratio as `H : T`. Takes effect immediately and persists to EEPROM.
+- **VFD — Yaskawa A1000** card — shows live VFD status (Running / Stopped / No comms) and current output speed in RPM. Controls: RPM input + **Set RPM**, **Run**, **Stop**, **Reset** (fault reset). The RPM is converted to a frequency command using the baseline scaling before sending via Modbus. Status auto-refreshes every 2 s.
 
 ### Settings tab
 
 - **Encoder** card — toggle to reverse the encoder direction without rewiring.
 - **Encoder PPR** card — set pulses per revolution (1–10 000). Presets: 100, 200, 400, 600, 1000, 2400.
 - **Stepper Pulley** card — set driver and driven pulley tooth counts. Set both to `1` for direct drive.
+- **VFD Settings** card — set the Modbus slave address (1–31), maximum frequency clamp (Hz), baseline frequency (Hz), and RPM at baseline frequency. All persist to EEPROM.
 - **WiFi** card — switch between AP and Station mode. In Station mode enter your router SSID and password; if connection fails within 20 s the device falls back to AP mode automatically. The Station credentials are preserved even after a fallback.
 
 > `http://gizmo.mt` resolves only while connected to the Pico's own AP. In Station mode use the IP address shown in the WiFi card, or press the physical button to display it on screen.
@@ -186,6 +253,13 @@ The UI has two tabs:
 | `/set-ppr` | POST | `ppr` | Set encoder PPR |
 | `/set-pulley` | POST | `driver`, `driven` | Set pulley tooth counts |
 | `/set-wifi` | GET | `mode`, `ssid`, `pass` | Configure WiFi |
+| `/vfd-rpm` | POST | `rpm` | Set VFD speed in RPM (converted to Hz by firmware) |
+| `/vfd-run` | POST | — | Send run (forward) command to VFD |
+| `/vfd-stop` | POST | — | Send stop command to VFD |
+| `/vfd-freq` | POST | `hz` (0.01 Hz units) | Set VFD frequency reference directly in 0.01 Hz units |
+| `/vfd-reset` | POST | — | Reset active VFD fault |
+| `/vfd-settings` | POST | `slave`, `maxhz`, `basehz`, `baserpm` | Set slave address, max/baseline frequency, baseline RPM |
+| `/vfd-status` | GET | — | Returns JSON: `{comms_ok, running, status, fault, freq, base_hz, base_rpm}` |
 
 ## Physical Button (GPIO 14)
 
@@ -205,11 +279,11 @@ To substitute a different driver (e.g. a step/dir driver like a DRV8825), replac
 
 ## EEPROM Layout
 
-Settings are stored in 141 bytes of emulated EEPROM:
+Settings are stored in 144 bytes of emulated EEPROM:
 
 | Bytes | Content |
 |---|---|
-| 0 | Magic byte (`0xAE`) — detects valid data |
+| 0 | Magic byte (`0xAF`) — detects valid data |
 | 1 | WiFi mode (0 = AP, 1 = STA) |
 | 2–65 | Station SSID (null-terminated, max 63 chars) |
 | 66–129 | Station password (null-terminated, max 63 chars) |
@@ -219,8 +293,12 @@ Settings are stored in 141 bytes of emulated EEPROM:
 | 135–136 | Encoder PPR (uint16_t, little-endian) |
 | 137–138 | `pulley_driver` (uint16_t, little-endian) |
 | 139–140 | `pulley_driven` (uint16_t, little-endian) |
+| 141 | VFD slave address (uint8_t) |
+| 142–143 | VFD max frequency (uint16_t, 0.01 Hz units, little-endian) |
+| 144–145 | VFD baseline frequency (uint16_t, 0.01 Hz units, little-endian) |
+| 146–147 | VFD baseline RPM (uint16_t, little-endian) |
 
-> The magic byte is checked on every boot. If it does not match `0xAE`, all settings revert to firmware defaults and EEPROM is re-initialised on next save.
+> The magic byte is checked on every boot. If it does not match `0xB0`, all settings revert to firmware defaults and EEPROM is re-initialised on next save.
 
 ## Building
 
@@ -253,4 +331,5 @@ Board: `rpipico2w`
 
 ## Reference Files
 
-- [`pico-arduino/`](pico-arduino/) — original simpler tachometer prototype (Pico, not 2W; encoder-only; no stepper, WiFi, or EEPROM). Kept as a reference.
+- [`src/a1000_modbus.json`](src/a1000_modbus.json) — complete Yaskawa A1000 MEMOBUS/Modbus register map: command/status bit definitions, all monitor registers, parameter addresses, fault codes, example raw byte sequences, and scaling reference.
+- [`pico-arduino/`](pico-arduino/) — original simpler tachometer prototype (Pico, not 2W; encoder-only; no stepper, WiFi, VFD, or EEPROM). Kept as a reference.

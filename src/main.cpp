@@ -40,6 +40,25 @@ static volatile uint32_t pulley_driven  = 1;   /* Teeth on output-side pulley   
 #define MOTOR_STEPS     200         /* Full steps per revolution */
 #define MICROSTEPS      256         /* Microstep resolution */
 
+/* ---- RS-485 / VFD (UART1) ---- */
+#define VFD_TX_PIN      8           /* UART1 TX → RS-485 RX-I */
+#define VFD_RX_PIN      9           /* UART1 RX ← RS-485 TX-O */
+#define VFD_DE_PIN      7           /* RS-485 DE/RE — HIGH = transmit, LOW = receive */
+#define VFD_BAUD        9600
+#define VFD_POLL_MS     500         /* Status poll interval */
+
+static uint8_t  vfd_slave      = 1;     /* Modbus slave address — runtime adjustable */
+static uint16_t vfd_max_hz     = 6000;  /* Max frequency setpoint (0.01 Hz units, 6000 = 60.00 Hz) */
+static uint16_t vfd_base_hz    = 6000;  /* Baseline frequency (0.01 Hz units) for RPM scaling */
+static uint16_t vfd_base_rpm   = 1750;  /* Motor RPM at baseline frequency */
+
+/* Live VFD state updated by vfd_poll() */
+static volatile uint16_t vfd_status_word = 0;
+static volatile uint16_t vfd_fault_code  = 0;
+static volatile bool     vfd_running     = false;
+static volatile uint16_t vfd_freq_ref    = 0;   /* last written frequency reference */
+static volatile bool     vfd_comms_ok    = false;
+
 /* ---- WiFi ---- */
 #define WIFI_AP_SSID  "MTGizmo"
 #define WIFI_AP_PASS  "hobbing1"        /* min 8 chars for WPA2 */
@@ -282,6 +301,226 @@ static void stepper_set_rpm(float rpm)
    END STEPPER DRIVER ABSTRACTION
    ========================================================================== */
 
+/* ==========================================================================
+   VFD MODBUS RTU — Yaskawa A1000 via SparkFun RS-485 Breakout on UART1
+   All VFD interaction is isolated here. Nothing outside this section touches
+   the VFD serial port or state variables directly.
+   ========================================================================== */
+
+/* CRC-16/IBM (Modbus) — process one byte at a time */
+static uint16_t modbus_crc(const uint8_t *buf, uint8_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+            else              crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+/* Drive DE high, send frame, wait for all bytes to leave the UART FIFO,
+   then drive DE low to release the bus for the response. */
+static void vfd_send_frame(const uint8_t *frame, uint8_t len)
+{
+    digitalWrite(VFD_DE_PIN, HIGH);
+    Serial2.write(frame, len);
+    Serial2.flush();                /* blocks until TX shift register is empty */
+    digitalWrite(VFD_DE_PIN, LOW);
+}
+
+/* Read up to max_len bytes with a timeout.  Returns actual byte count received.
+   Timing budget: H5-06 transmit wait (default 5 ms, max 65 ms) + frame TX time.
+   Worst case: 65 ms wait + 9 bytes × 11 bits/9600 baud ≈ 75 ms → 100 ms is safe. */
+static uint8_t vfd_recv_frame(uint8_t *buf, uint8_t max_len, uint32_t timeout_ms = 100)
+{
+    uint32_t t   = millis();
+    uint8_t  idx = 0;
+    while (idx < max_len && (millis() - t) < timeout_ms) {
+        if (Serial2.available()) {
+            buf[idx++] = (uint8_t)Serial2.read();
+            t = millis();           /* reset timeout on each received byte */
+        }
+    }
+    return idx;
+}
+
+/* Flush any stale bytes left in the RX buffer before a new transaction */
+static void vfd_flush_rx()
+{
+    while (Serial2.available()) Serial2.read();
+}
+
+/* FC 06 — Write Single Register.  Returns true on a valid echo response. */
+static bool vfd_write_reg(uint16_t reg, uint16_t value)
+{
+    uint8_t frame[8];
+    frame[0] = vfd_slave;
+    frame[1] = 0x06;
+    frame[2] = (uint8_t)(reg >> 8);
+    frame[3] = (uint8_t)(reg & 0xFF);
+    frame[4] = (uint8_t)(value >> 8);
+    frame[5] = (uint8_t)(value & 0xFF);
+    uint16_t crc = modbus_crc(frame, 6);
+    frame[6] = (uint8_t)(crc & 0xFF);
+    frame[7] = (uint8_t)(crc >> 8);
+
+    vfd_flush_rx();
+    vfd_send_frame(frame, 8);
+
+    uint8_t resp[8];
+    uint8_t n = vfd_recv_frame(resp, 8);
+    if (n < 8) return false;
+    uint16_t resp_crc = (uint16_t)resp[7] << 8 | resp[6];
+    if (modbus_crc(resp, 6) != resp_crc) return false;
+    /* FC 06 success: drive echoes the request unchanged */
+    return (resp[0] == frame[0] && resp[1] == 0x06 &&
+            resp[2] == frame[2] && resp[3] == frame[3] &&
+            resp[4] == frame[4] && resp[5] == frame[5]);
+}
+
+/* FC 03 — Read Holding Registers.  Fills out[] with `count` register values.
+   Returns true on a valid response. */
+static bool vfd_read_regs(uint16_t start_reg, uint8_t count, uint16_t *out)
+{
+    if (count == 0 || count > 16) return false;
+    uint8_t frame[8];
+    frame[0] = vfd_slave;
+    frame[1] = 0x03;
+    frame[2] = (uint8_t)(start_reg >> 8);
+    frame[3] = (uint8_t)(start_reg & 0xFF);
+    frame[4] = 0x00;
+    frame[5] = count;
+    uint16_t crc = modbus_crc(frame, 6);
+    frame[6] = (uint8_t)(crc & 0xFF);
+    frame[7] = (uint8_t)(crc >> 8);
+
+    uint8_t resp_len = 5 + count * 2;   /* addr + FC + byte_count + data + 2×CRC */
+    vfd_flush_rx();
+    vfd_send_frame(frame, 8);
+
+    uint8_t resp[40];
+    uint8_t n = vfd_recv_frame(resp, resp_len);
+    if (n < resp_len) return false;
+    uint16_t resp_crc = (uint16_t)resp[n - 1] << 8 | resp[n - 2];
+    if (modbus_crc(resp, n - 2) != resp_crc) return false;
+    if (resp[0] != vfd_slave || resp[1] != 0x03) return false;
+    for (uint8_t i = 0; i < count; i++)
+        out[i] = (uint16_t)resp[3 + i * 2] << 8 | resp[4 + i * 2];
+    return true;
+}
+
+/* ---- High-level VFD commands ---- */
+
+/* Run forward at whatever frequency reference is currently set */
+static bool vfd_run()     { return vfd_write_reg(0x0001, 0x0001); }
+
+/* Run reverse */
+static bool vfd_reverse() { return vfd_write_reg(0x0001, 0x0002); }
+
+/* Stop (coast / decelerate per drive config) */
+static bool vfd_stop() { return vfd_write_reg(0x0001, 0x0000); }
+
+/* Reset active fault — rising edge on bit 3, then clear */
+static bool vfd_reset_fault()
+{
+    bool ok = vfd_write_reg(0x0001, 0x0008);
+    delay(50);
+    ok &= vfd_write_reg(0x0001, 0x0000);
+    return ok;
+}
+
+/* Set frequency reference in 0.01 Hz units (e.g. 6000 = 60.00 Hz).
+   Clamps to [0, vfd_max_hz]. */
+static bool vfd_set_freq(uint16_t hz_hundredths)
+{
+    if (hz_hundredths > vfd_max_hz) hz_hundredths = vfd_max_hz;
+    vfd_freq_ref = hz_hundredths;
+    return vfd_write_reg(0x0002, hz_hundredths);
+}
+
+/* Decode fault code to a short string.  Returns pointer to a string literal. */
+static const char *vfd_fault_name(uint16_t code)
+{
+    switch (code) {
+        case 0x01: return "oC — Overcurrent";
+        case 0x02: return "ov — Overvoltage";
+        case 0x03: return "oH1 — Heatsink overheat";
+        case 0x04: return "oH2 — Internal overheat";
+        case 0x05: return "oL1 — Motor overload";
+        case 0x06: return "oL2 — Drive overload";
+        case 0x07: return "oL3 — Overtorque 1";
+        case 0x08: return "oL4 — Overtorque 2";
+        case 0x09: return "rr — DB transistor fault";
+        case 0x0A: return "rH — DB resistor overheat";
+        case 0x0B: return "EF — External fault";
+        case 0x0C: return "EF0 — Modbus fault";
+        case 0x0D: return "EF1 — External fault S1";
+        case 0x0E: return "EF2 — External fault S2";
+        case 0x0F: return "EF3 — External fault S3";
+        case 0x10: return "PF — Input phase loss";
+        case 0x11: return "LF — Output phase loss";
+        case 0x12: return "oH3 — Motor overheat";
+        case 0x13: return "oS — Overspeed";
+        case 0x14: return "dEv — Speed deviation";
+        case 0x15: return "PGo — PG open";
+        case 0x17: return "CE — Modbus comm error";
+        case 0x18: return "bUS — Option comm error";
+        case 0x1E: return "SC — Short circuit/GND";
+        case 0x1F: return "UV1 — DC undervoltage";
+        case 0x20: return "UV2 — Ctrl supply UV";
+        case 0x21: return "UV3 — Soft-charge fault";
+        case 0x22: return "SE — EEPROM write error";
+        case 0x23: return "CPF — Control circuit";
+        case 0x24: return "oH4 — Drive overheat";
+        default:   return "Unknown fault";
+    }
+}
+
+/* Called periodically from loop() — reads status word and fault code.
+   Shows overlay on new faults or on fault clearance. */
+static void vfd_poll()
+{
+    uint16_t regs[2];
+    bool ok = vfd_read_regs(0x0020, 2, regs);   /* 0x0020 = status, 0x0021 = fault code */
+    vfd_comms_ok = ok;
+    if (!ok) return;
+
+    uint16_t new_status = regs[0];
+    uint16_t new_fault  = regs[1];
+
+    /* Fault appeared */
+    if (new_fault != 0 && new_fault != vfd_fault_code) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "VFD Fault: %s", vfd_fault_name(new_fault));
+        show_overlay(msg, 6000);
+    }
+    /* Fault cleared */
+    if (new_fault == 0 && vfd_fault_code != 0) {
+        show_overlay("VFD Fault Cleared", 3000);
+    }
+
+    vfd_status_word = new_status;
+    vfd_fault_code  = new_fault;
+    vfd_running     = (new_status & 0x0001) != 0;
+}
+
+/* Initialise UART and the DE pin.  Called once from setup().
+   Serial2 maps to HW UART1 on GPIO 8/9 in the rpipico2w variant
+   (PIN_SERIAL2_TX=8, PIN_SERIAL2_RX=9). */
+static void vfd_init()
+{
+    pinMode(VFD_DE_PIN, OUTPUT);
+    digitalWrite(VFD_DE_PIN, LOW);   /* receive mode */
+    Serial2.begin(VFD_BAUD, SERIAL_8N2);
+}
+
+/* ==========================================================================
+   END VFD MODBUS RTU
+   ========================================================================== */
+
 /* ---- Compute required stepper RPM from encoder RPM and apply it ---- */
 static void set_stepper_rpm(int32_t signed_rpm)
 {
@@ -413,6 +652,41 @@ static const String WEB_PAGE =
     "</form>"
     "<div class='msg' id='msgRatio'></div>"
     "</div>"
+    /* ---- VFD card (Home tab) ---- */
+    "<div class='card'>"
+    "<h2>VFD — Yaskawa A1000</h2>"
+    "<label>Status</label>"
+    "<div id='vfdStatus' style='font-size:1.1rem;font-weight:600;color:#aaa'>--</div>"
+    "<label style='margin-top:4px'>Output speed</label>"
+    "<div id='vfdRpm' style='font-size:1.1rem;color:#aaa'>-- RPM</div>"
+    "<label style='margin-top:4px'>Speed setpoint (RPM)</label>"
+    "<div style='display:flex;gap:8px;margin-top:6px'>"
+    "<input type='number' id='vfdRpmIn' min='0' step='1'"
+    " placeholder='e.g. 1750' style='flex:1'>"
+    "<button type='button' onclick='vfdSetRpm()'"
+    " style='padding:0 14px;background:#2a2a2a;border:1px solid #444;"
+    "border-radius:6px;color:#ccc;cursor:pointer;font-size:.9rem;"
+    "white-space:nowrap'>Set RPM</button>"
+    "</div>"
+    "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>"
+    "<button type='button' onclick='vfdCmd(\"/vfd-run\")'"
+    " style='padding:10px;background:#166534;border:none;"
+    "border-radius:6px;color:#fff;font-size:.9rem;font-weight:600;"
+    "cursor:pointer'>Run ▶</button>"
+    "<button type='button' onclick='vfdCmd(\"/vfd-reverse\")'"
+    " style='padding:10px;background:#1e3a5f;border:none;"
+    "border-radius:6px;color:#fff;font-size:.9rem;font-weight:600;"
+    "cursor:pointer'>◀ Reverse</button>"
+    "<button type='button' onclick='vfdCmd(\"/vfd-stop\")'"
+    " style='padding:10px;background:#7f1d1d;border:none;"
+    "border-radius:6px;color:#fff;font-size:.9rem;font-weight:600;"
+    "cursor:pointer'>Stop ■</button>"
+    "<button type='button' onclick='vfdCmd(\"/vfd-reset\")'"
+    " style='padding:10px;background:#2a2a2a;border:1px solid #444;"
+    "border-radius:6px;color:#ccc;font-size:.9rem;cursor:pointer'>Reset</button>"
+    "</div>"
+    "<div class='msg' id='msgVfd'></div>"
+    "</div>"
     "</div>"
     /* ---- Settings page ---- */
     "<div class='page' id='pageSettings'>"
@@ -488,6 +762,26 @@ static const String WEB_PAGE =
     "<button type='submit' style='margin-top:14px'>Apply WiFi</button>"
     "</form>"
     "<div class='msg' id='msgWifi'></div>"
+    "</div>"
+    /* VFD Settings card */
+    "<div class='card'>"
+    "<h2>VFD Settings</h2>"
+    "<form id='fVfdSettings'>"
+    "<label for='vfdSlave'>Modbus slave address (1–31)</label>"
+    "<input type='number' id='vfdSlave' name='slave' min='1' max='31' step='1'"
+    " value='__VFDSLAVE__' required style='margin-top:6px'>"
+    "<label for='vfdMaxHz' style='margin-top:10px'>Max frequency (Hz, 0.01–400.00)</label>"
+    "<input type='number' id='vfdMaxHz' name='maxhz' min='0.01' max='400' step='0.01'"
+    " value='__VFDMAXHZ__' required style='margin-top:6px'>"
+    "<label for='vfdBaseHz' style='margin-top:10px'>Baseline frequency (Hz)</label>"
+    "<input type='number' id='vfdBaseHz' name='basehz' min='0.01' max='400' step='0.01'"
+    " value='__VFDBASEHZ__' required style='margin-top:6px'>"
+    "<label for='vfdBaseRpm' style='margin-top:10px'>RPM at baseline frequency</label>"
+    "<input type='number' id='vfdBaseRpm' name='baserpm' min='1' max='60000' step='1'"
+    " value='__VFDBASERPM__' required style='margin-top:6px'>"
+    "<button type='submit' style='margin-top:14px'>Save VFD Settings</button>"
+    "</form>"
+    "<div class='msg' id='msgVfdSettings'></div>"
     "</div>"
     "</div>"
     "<script>"
@@ -569,6 +863,66 @@ static const String WEB_PAGE =
     "el.textContent=txt;el.className=err?'msg err':'msg';"
     "setTimeout(function(){el.textContent='';},4000);"
     "}"
+    /* VFD status poll (every 2 s while on Home tab) */
+    "var vfdPollTimer=null;"
+    "function startVfdPoll(){"
+    "if(vfdPollTimer)return;"
+    "vfdPollTimer=setInterval(async function(){"
+    "try{"
+    "var r=await fetch('/vfd-status');"
+    "var d=await r.json();"
+    "document.getElementById('vfdStatus').textContent="
+    "d.comms_ok?(d.running?'Running':'Stopped'):'No comms';"
+    "document.getElementById('vfdStatus').style.color="
+    "d.comms_ok?(d.running?'#4ade80':'#aaa'):'#f87171';"
+    "var rpm=Math.round(d.freq*d.base_rpm/d.base_hz);"
+    "document.getElementById('vfdRpm').textContent=(d.comms_ok?rpm+' RPM':'-- RPM');"
+    "}catch(e){}"
+    "},2000);"
+    "}"
+    "function stopVfdPoll(){clearInterval(vfdPollTimer);vfdPollTimer=null;}"
+    /* patch showPage to start/stop VFD poll */
+    "var _origShowPage=showPage;"
+    "showPage=function(p){"
+    "_origShowPage(p);"
+    "if(p==='home')startVfdPoll();else stopVfdPoll();"
+    "};"
+    "startVfdPoll();"
+    /* VFD command buttons */
+    "async function vfdCmd(url){"
+    "try{"
+    "var r=await fetch(url,{method:'POST'});"
+    "var t=await r.text();"
+    "showMsg('msgVfd',t,!r.ok);"
+    "}catch(e){showMsg('msgVfd','Error',true);}"
+    "}"
+    /* VFD set speed in RPM — firmware converts to Hz */
+    "async function vfdSetRpm(){"
+    "var v=parseInt(document.getElementById('vfdRpmIn').value);"
+    "if(isNaN(v)||v<0){showMsg('msgVfd','Enter a valid RPM',true);return;}"
+    "try{"
+    "var r=await fetch('/vfd-rpm?rpm='+v,{method:'POST'});"
+    "var t=await r.text();"
+    "showMsg('msgVfd',t,!r.ok);"
+    "}catch(e){showMsg('msgVfd','Error',true);}"
+    "}"
+    /* VFD settings form */
+    "document.getElementById('fVfdSettings').addEventListener('submit',async function(e){"
+    "e.preventDefault();"
+    "var s=parseInt(document.getElementById('vfdSlave').value);"
+    "var m=parseFloat(document.getElementById('vfdMaxHz').value);"
+    "var bh=parseFloat(document.getElementById('vfdBaseHz').value);"
+    "var br=parseInt(document.getElementById('vfdBaseRpm').value);"
+    "if(isNaN(s)||s<1||s>31){showMsg('msgVfdSettings','Slave must be 1–31',true);return;}"
+    "if(isNaN(m)||m<=0||m>400){showMsg('msgVfdSettings','Max Hz must be 0.01–400',true);return;}"
+    "if(isNaN(bh)||bh<=0||bh>400){showMsg('msgVfdSettings','Baseline Hz must be 0.01–400',true);return;}"
+    "if(isNaN(br)||br<1||br>60000){showMsg('msgVfdSettings','Baseline RPM must be 1–60000',true);return;}"
+    "var cents=Math.round(m*100);"
+    "var bcents=Math.round(bh*100);"
+    "var r=await fetch('/vfd-settings?slave='+s+'&maxhz='+cents+'&basehz='+bcents+'&baserpm='+br,{method:'POST'});"
+    "var t=await r.text();"
+    "showMsg('msgVfdSettings',t,!r.ok);"
+    "});"
     "</script></body></html>";
 
 static void apply_wifi_config();   /* forward declarations */
@@ -595,6 +949,19 @@ static void handle_root()
     page.replace("__WIFIMODE__", wifi_mode == MODE_AP ? "AP" : "STA");
     page.replace("__APSEL__",    wifi_mode == MODE_AP  ? "selected" : "");
     page.replace("__STASEL__",   wifi_mode == MODE_STA ? "selected" : "");
+    /* VFD settings placeholders */
+    char vfd_slave_buf[4];
+    snprintf(vfd_slave_buf, sizeof(vfd_slave_buf), "%u", (unsigned)vfd_slave);
+    page.replace("__VFDSLAVE__", vfd_slave_buf);
+    char vfd_maxhz_buf[10];
+    snprintf(vfd_maxhz_buf, sizeof(vfd_maxhz_buf), "%.2f", vfd_max_hz / 100.0f);
+    page.replace("__VFDMAXHZ__", vfd_maxhz_buf);
+    char vfd_basehz_buf[10];
+    snprintf(vfd_basehz_buf, sizeof(vfd_basehz_buf), "%.2f", vfd_base_hz / 100.0f);
+    page.replace("__VFDBASEHZ__", vfd_basehz_buf);
+    char vfd_baserpm_buf[8];
+    snprintf(vfd_baserpm_buf, sizeof(vfd_baserpm_buf), "%u", (unsigned)vfd_base_rpm);
+    page.replace("__VFDBASERPM__", vfd_baserpm_buf);
     server.send(200, "text/html", page);
 }
 
@@ -670,6 +1037,128 @@ static void handle_set_pulley()
 
 /* ip_show_until is defined in loop() as a static — declare it here so show_overlay can set it */
 static uint32_t g_ip_show_until = 0;
+
+/* ---- VFD web handlers ---- */
+
+static void handle_vfd_run()
+{
+    bool ok = vfd_run();
+    server.send(ok ? 200 : 502, "text/plain", ok ? "Run command sent" : "VFD comms error");
+}
+
+static void handle_vfd_reverse()
+{
+    bool ok = vfd_reverse();
+    server.send(ok ? 200 : 502, "text/plain", ok ? "Reverse command sent" : "VFD comms error");
+}
+
+static void handle_vfd_stop()
+{
+    bool ok = vfd_stop();
+    server.send(ok ? 200 : 502, "text/plain", ok ? "Stop command sent" : "VFD comms error");
+}
+
+static void handle_vfd_reset()
+{
+    bool ok = vfd_reset_fault();
+    server.send(ok ? 200 : 502, "text/plain", ok ? "Fault reset sent" : "VFD comms error");
+}
+
+static void handle_vfd_freq()
+{
+    if (!server.hasArg("hz")) {
+        server.send(400, "text/plain", "Missing hz parameter");
+        return;
+    }
+    int val = server.arg("hz").toInt();
+    if (val < 0 || val > 40000) {
+        server.send(400, "text/plain", "hz must be 0–40000 (0.01 Hz units)");
+        return;
+    }
+    bool ok = vfd_set_freq((uint16_t)val);
+    char buf[32];
+    snprintf(buf, sizeof(buf), ok ? "Freq set: %.2f Hz" : "VFD comms error",
+             val / 100.0f);
+    server.send(ok ? 200 : 502, "text/plain", buf);
+}
+
+static void handle_vfd_rpm()
+{
+    if (!server.hasArg("rpm")) {
+        server.send(400, "text/plain", "Missing rpm parameter");
+        return;
+    }
+    int rpm_val = server.arg("rpm").toInt();
+    if (rpm_val < 0) {
+        server.send(400, "text/plain", "rpm must be >= 0");
+        return;
+    }
+    /* Convert RPM → frequency in 0.01 Hz units using the scaling curve:
+       hz = rpm × (vfd_base_hz / vfd_base_rpm) */
+    uint32_t hz_cents = ((uint32_t)rpm_val * vfd_base_hz) / vfd_base_rpm;
+    if (hz_cents > 40000) hz_cents = 40000;
+    bool ok = vfd_set_freq((uint16_t)hz_cents);
+    char buf[48];
+    snprintf(buf, sizeof(buf), ok ? "Speed set: %d RPM (%.2f Hz)" : "VFD comms error",
+             rpm_val, hz_cents / 100.0f);
+    server.send(ok ? 200 : 502, "text/plain", buf);
+}
+
+static void handle_vfd_settings()
+{
+    if (!server.hasArg("slave") || !server.hasArg("maxhz") ||
+        !server.hasArg("basehz") || !server.hasArg("baserpm")) {
+        server.send(400, "text/plain", "Missing parameter");
+        return;
+    }
+    int s  = server.arg("slave").toInt();
+    int m  = server.arg("maxhz").toInt();
+    int bh = server.arg("basehz").toInt();
+    int br = server.arg("baserpm").toInt();
+    if (s < 1 || s > 31) {
+        server.send(400, "text/plain", "slave must be 1–31");
+        return;
+    }
+    if (m < 1 || m > 40000) {
+        server.send(400, "text/plain", "maxhz must be 1–40000 (0.01 Hz units)");
+        return;
+    }
+    if (bh < 1 || bh > 40000) {
+        server.send(400, "text/plain", "basehz must be 1–40000 (0.01 Hz units)");
+        return;
+    }
+    if (br < 1 || br > 60000) {
+        server.send(400, "text/plain", "baserpm must be 1–60000");
+        return;
+    }
+    vfd_slave    = (uint8_t)s;
+    vfd_max_hz   = (uint16_t)m;
+    vfd_base_hz  = (uint16_t)bh;
+    vfd_base_rpm = (uint16_t)br;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Saved: slave=%d, max=%.2f Hz, base=%.2f Hz @ %d RPM",
+             s, m / 100.0f, bh / 100.0f, br);
+    server.send(200, "text/plain", buf);
+    save_config();
+}
+
+static void handle_vfd_status()
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"comms_ok\":%s,\"running\":%s,\"status\":%u,\"fault\":%u,"
+             "\"freq\":%u,\"base_hz\":%u,\"base_rpm\":%u}",
+             vfd_comms_ok ? "true" : "false",
+             vfd_running  ? "true" : "false",
+             (unsigned)vfd_status_word,
+             (unsigned)vfd_fault_code,
+             (unsigned)vfd_freq_ref,
+             (unsigned)vfd_base_hz,
+             (unsigned)vfd_base_rpm);
+    server.send(200, "application/json", buf);
+}
+
+/* ---- End VFD web handlers ---- */
 
 static void show_overlay(const char *text, uint32_t duration_ms)
 {
@@ -777,7 +1266,10 @@ static void apply_wifi_config()
         current_ip = "192.168.4.1";
         dnsServer.start(53, WIFI_HOSTNAME, local);
 
-        show_overlay((String(WIFI_AP_SSID) + "\n192.168.4.1").c_str(), 4000);
+        /* duration_ms=0 → stays visible until explicitly hidden or overwritten;
+           the overlay will be on screen when loop() starts and cleared on next button press */
+        show_overlay((String(WIFI_AP_SSID) + "\n192.168.4.1").c_str(), 0);
+        lvgl_delay(200);    /* one render pass so the frame is actually pushed to the display */
     }
 
     server.begin();
@@ -786,7 +1278,7 @@ static void apply_wifi_config()
 
 /* ---- Persistent config (EEPROM) ----
    Layout (byte offsets):
-     0        : magic byte (0xAE = valid data present)
+     0        : magic byte (0xAF = valid data present)
      1        : wifi_mode (0 = AP, 1 = STA)
      2–65     : sta_ssid  (null-terminated, max 63 chars)
      66–129   : sta_password (null-terminated, max 63 chars)
@@ -795,7 +1287,11 @@ static void apply_wifi_config()
      134      : encoder_reversed (0 or 1)
      135–136  : encoder_ppr    (uint16_t, 2 bytes)
      137–138  : pulley_driver  (uint16_t, 2 bytes)
-     139–140  : pulley_driven  (uint16_t, 2 bytes)         */
+     139–140  : pulley_driven  (uint16_t, 2 bytes)
+     141      : vfd_slave      (uint8_t)
+     142–143  : vfd_max_hz     (uint16_t, 0.01 Hz units)
+     144–145  : vfd_base_hz    (uint16_t, 0.01 Hz units)
+     146–147  : vfd_base_rpm   (uint16_t)                */
 #define EE_MAGIC_ADDR      0
 #define EE_MODE_ADDR       1
 #define EE_SSID_ADDR       2
@@ -806,8 +1302,12 @@ static void apply_wifi_config()
 #define EE_PPR_ADDR        135
 #define EE_PULLEY_DRV_ADDR 137   /* pulley_driver uint16_t */
 #define EE_PULLEY_DRN_ADDR 139   /* pulley_driven uint16_t */
-#define EE_TOTAL_SIZE      141
-#define EE_MAGIC_VAL       0xAE   /* bumped from 0xAD — forces re-init on first boot */
+#define EE_VFD_SLAVE_ADDR  141   /* vfd_slave    uint8_t  */
+#define EE_VFD_MAXHZ_ADDR  142   /* vfd_max_hz   uint16_t */
+#define EE_VFD_BASEHZ_ADDR 144   /* vfd_base_hz  uint16_t */
+#define EE_VFD_BASERPM_ADDR 146  /* vfd_base_rpm uint16_t */
+#define EE_TOTAL_SIZE      148
+#define EE_MAGIC_VAL       0xB0   /* bumped from 0xAF — forces re-init on first boot */
 
 static void save_config()
 {
@@ -848,6 +1348,18 @@ static void save_config()
     EEPROM.write(EE_PULLEY_DRV_ADDR + 1, (uint8_t)(pdrv >> 8));
     EEPROM.write(EE_PULLEY_DRN_ADDR,     (uint8_t)(pdrn & 0xFF));
     EEPROM.write(EE_PULLEY_DRN_ADDR + 1, (uint8_t)(pdrn >> 8));
+
+    /* Write VFD slave address, max frequency, baseline frequency and RPM */
+    EEPROM.write(EE_VFD_SLAVE_ADDR, vfd_slave);
+    uint16_t vmaxhz = vfd_max_hz;
+    EEPROM.write(EE_VFD_MAXHZ_ADDR,     (uint8_t)(vmaxhz & 0xFF));
+    EEPROM.write(EE_VFD_MAXHZ_ADDR + 1, (uint8_t)(vmaxhz >> 8));
+    uint16_t vbasehz = vfd_base_hz;
+    EEPROM.write(EE_VFD_BASEHZ_ADDR,     (uint8_t)(vbasehz & 0xFF));
+    EEPROM.write(EE_VFD_BASEHZ_ADDR + 1, (uint8_t)(vbasehz >> 8));
+    uint16_t vbaserpm = vfd_base_rpm;
+    EEPROM.write(EE_VFD_BASERPM_ADDR,     (uint8_t)(vbaserpm & 0xFF));
+    EEPROM.write(EE_VFD_BASERPM_ADDR + 1, (uint8_t)(vbaserpm >> 8));
 
     EEPROM.commit();
     EEPROM.end();
@@ -905,6 +1417,26 @@ static void load_config()
     if (pdrn_load >= 1 && pdrn_load <= 9999)
         pulley_driven = pdrn_load;
 
+    /* Read VFD slave address, max frequency, baseline frequency and RPM */
+    uint8_t vfd_slave_load = EEPROM.read(EE_VFD_SLAVE_ADDR);
+    if (vfd_slave_load >= 1 && vfd_slave_load <= 31)
+        vfd_slave = vfd_slave_load;
+
+    uint16_t vfd_maxhz_load = (uint16_t)EEPROM.read(EE_VFD_MAXHZ_ADDR)
+                            | ((uint16_t)EEPROM.read(EE_VFD_MAXHZ_ADDR + 1) << 8);
+    if (vfd_maxhz_load >= 1 && vfd_maxhz_load <= 40000)
+        vfd_max_hz = vfd_maxhz_load;
+
+    uint16_t vfd_basehz_load = (uint16_t)EEPROM.read(EE_VFD_BASEHZ_ADDR)
+                             | ((uint16_t)EEPROM.read(EE_VFD_BASEHZ_ADDR + 1) << 8);
+    if (vfd_basehz_load >= 1 && vfd_basehz_load <= 40000)
+        vfd_base_hz = vfd_basehz_load;
+
+    uint16_t vfd_baserpm_load = (uint16_t)EEPROM.read(EE_VFD_BASERPM_ADDR)
+                              | ((uint16_t)EEPROM.read(EE_VFD_BASERPM_ADDR + 1) << 8);
+    if (vfd_baserpm_load >= 1 && vfd_baserpm_load <= 60000)
+        vfd_base_rpm = vfd_baserpm_load;
+
     EEPROM.end();
 }
 
@@ -915,8 +1447,16 @@ static void setup_wifi()
     server.on("/set",          HTTP_POST, handle_set);
     server.on("/set-encoder",  HTTP_POST, handle_set_encoder);
     server.on("/set-ppr",      HTTP_POST, handle_set_ppr);
-    server.on("/set-pulley",  HTTP_POST, handle_set_pulley);
-    server.on("/set-wifi",    HTTP_GET,  handle_set_wifi);
+    server.on("/set-pulley",   HTTP_POST, handle_set_pulley);
+    server.on("/set-wifi",     HTTP_GET,  handle_set_wifi);
+    server.on("/vfd-rpm",      HTTP_POST, handle_vfd_rpm);
+    server.on("/vfd-run",      HTTP_POST, handle_vfd_run);
+    server.on("/vfd-reverse",  HTTP_POST, handle_vfd_reverse);
+    server.on("/vfd-stop",     HTTP_POST, handle_vfd_stop);
+    server.on("/vfd-reset",    HTTP_POST, handle_vfd_reset);
+    server.on("/vfd-freq",     HTTP_POST, handle_vfd_freq);
+    server.on("/vfd-settings", HTTP_POST, handle_vfd_settings);
+    server.on("/vfd-status",   HTTP_GET,  handle_vfd_status);
     apply_wifi_config();
 }
 
@@ -956,6 +1496,9 @@ void setup()
 
     /* ---- Initialise stepper driver ---- */
     stepper_init();
+
+    /* ---- Initialise VFD serial port ---- */
+    vfd_init();
 
     /* ---- Start WiFi AP and web server ---- */
     setup_wifi();
@@ -1048,6 +1591,13 @@ void loop()
     }
 
     lv_timer_handler();
+
+    /* ---- Poll VFD status ---- */
+    static uint32_t last_vfd_ms = 0;
+    if (now - last_vfd_ms >= VFD_POLL_MS) {
+        last_vfd_ms = now;
+        vfd_poll();
+    }
 
     /* Service web requests */
     server.handleClient();
