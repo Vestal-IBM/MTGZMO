@@ -41,8 +41,10 @@ static volatile uint32_t pulley_driven  = 1;   /* Teeth on output-side pulley   
 #define VFD_BTN_REVERSE    5        /* VFD Reverse (run reverse) — pulled up, active LOW */
 #define VFD_BTN_STOP       6        /* VFD Stop — pulled up, active LOW */
 #define RPM_SRC_BTN       16        /* RPM source select — held LOW = VFD, open = encoder */
+#define VFD_LOCK_BTN      22        /* Web VFD control lockout — held LOW = controls disabled */
 #define VFD_POT_PIN       26        /* RPM potentiometer wiper — ADC0 (GPIO 26) */
-#define VFD_POT_DEADBAND   8        /* ADC counts of change required to trigger a write */
+#define VFD_POT_DEADBAND  32        /* ADC counts of change required to trigger a write (~0.5 Hz hysteresis) */
+#define VFD_POT_MIN       100       /* ADC counts at full CCW — maps to 0 Hz (tune if needed) */
 #define MOTOR_STEPS     200         /* Full steps per revolution */
 #define MICROSTEPS      256         /* Microstep resolution */
 
@@ -852,15 +854,15 @@ static const String WEB_PAGE =
     "<label style='margin-top:4px'>Set Speed</label>"
     "<div id='vfdSetpoint' style='font-size:1.1rem;color:#aaa'>-- RPM</div>"
     "<label style='margin-top:4px'>Speed Setting (RPM)</label>"
-    "<div style='display:flex;gap:8px;margin-top:6px'>"
+    "<div id='vfdRpmRow' style='display:flex;gap:8px;margin-top:6px'>"
     "<input type='number' id='vfdRpmIn' min='0' step='1'"
     " placeholder='e.g. 1750' style='flex:1'>"
-    "<button type='button' onclick='vfdSetRpm()'"
+    "<button type='button' onclick='vfdSetRpm()' id='vfdRpmBtn'"
     " style='padding:0 14px;background:#2a2a2a;border:1px solid #444;"
     "border-radius:6px;color:#ccc;cursor:pointer;font-size:.9rem;"
     "white-space:nowrap'>Set RPM</button>"
     "</div>"
-    "<div style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>"
+    "<div id='vfdCtrlBtns' style='display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px'>"
     "<button type='button' onclick='vfdCmd(\"/vfd-run\")'"
     " style='padding:10px;background:#166534;border:none;"
     "border-radius:6px;color:#fff;font-size:.9rem;font-weight:600;"
@@ -877,6 +879,8 @@ static const String WEB_PAGE =
     " style='padding:10px;background:#2a2a2a;border:1px solid #444;"
     "border-radius:6px;color:#ccc;font-size:.9rem;cursor:pointer'>Reset</button>"
     "</div>"
+    "<div id='vfdLockNote' style='display:none;font-size:.8rem;color:#888;"
+    "margin-top:4px'>Controls locked by hardware switch</div>"
     "<div class='msg' id='msgVfd'></div>"
     "</div>"
     "</div>"
@@ -941,8 +945,19 @@ static const String WEB_PAGE =
     "<option value='sta' __STASEL__>Station (connect to router)</option>"
     "</select>"
     "<div id='staFields' style='margin-top:10px;flex-direction:column;gap:10px'>"
-    "<div><label for='wssid'>SSID</label>"
-    "<input type='text' id='wssid' name='ssid' placeholder='Network name' style='margin-top:4px'></div>"
+    "<div>"
+    "<div style='display:flex;justify-content:space-between;align-items:center'>"
+    "<label>SSID</label>"
+    "<button type='button' onclick='scanWifi()' id='btnScan'"
+    " style='padding:2px 10px;background:#2a2a2a;border:1px solid #444;border-radius:6px;"
+    "color:#ccc;cursor:pointer;font-size:.8rem;white-space:nowrap'>Scan</button>"
+    "</div>"
+    "<select id='ssidSelect' style='margin-top:4px;width:100%' onchange='document.getElementById(\"wssid\").value=this.value'>"
+    "<option value=''>-- select network --</option>"
+    "</select>"
+    "<input type='text' id='wssid' name='ssid'"
+    " placeholder='Or type network name' style='margin-top:6px'>"
+    "</div>"
     "<div><label for='wpass'>Password</label>"
     "<div style='display:flex;gap:8px;margin-top:4px'>"
     "<input type='password' id='wpass' name='pass' placeholder='Password' style='flex:1'>"
@@ -1017,8 +1032,28 @@ static const String WEB_PAGE =
     "function toggleSTA(){"
     "var m=document.getElementById('wmode').value;"
     "document.getElementById('staFields').style.display=(m==='sta'?'flex':'none');"
+    "if(m==='sta')scanWifi();"
     "}"
     "toggleSTA();"
+    "async function scanWifi(){"
+    "var btn=document.getElementById('btnScan');"
+    "btn.textContent='Scanning...';btn.disabled=true;"
+    "var sel=document.getElementById('ssidSelect');"
+    "sel.innerHTML='<option value=\"\">-- scanning --</option>';"
+    "try{"
+    "var r=await fetch('/wifi-scan');"
+    "var d=await r.json();"
+    "sel.innerHTML='<option value=\"\">-- select network --</option>';"
+    "if(d.length===0){"
+    "sel.innerHTML='<option value=\"\">No networks found</option>';}"
+    "else{"
+    "d.forEach(function(s){"
+    "var o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o);"
+    "});}"
+    "}catch(e){"
+    "sel.innerHTML='<option value=\"\">Scan failed</option>';}"
+    "btn.textContent='Scan';btn.disabled=false;"
+    "}"
     /* password reveal */
     "function togglePw(){"
     "var inp=document.getElementById('wpass');"
@@ -1075,6 +1110,14 @@ static const String WEB_PAGE =
     "document.getElementById('vfdRpm').textContent=(d.comms_ok?outRpm+' RPM':'-- RPM');"
     "var setRpm=d.freq>0?Math.round(d.freq*d.base_rpm/d.base_hz):0;"
     "document.getElementById('vfdSetpoint').textContent=(d.comms_ok?setRpm+' RPM':'-- RPM');"
+    "var locked=!!d.web_lock;"
+    "document.getElementById('vfdRpmIn').disabled=locked;"
+    "document.getElementById('vfdRpmBtn').disabled=locked;"
+    "document.getElementById('vfdRpmRow').style.opacity=locked?'0.35':'1';"
+    "var btns=document.getElementById('vfdCtrlBtns').querySelectorAll('button');"
+    "btns.forEach(function(b){b.disabled=locked;});"
+    "document.getElementById('vfdCtrlBtns').style.opacity=locked?'0.35':'1';"
+    "document.getElementById('vfdLockNote').style.display=locked?'block':'none';"
     "}catch(e){}"
     "},500);"
     "}"
@@ -1295,12 +1338,30 @@ static void handle_vfd_rpm()
        hz = rpm × (vfd_base_hz / vfd_base_rpm)
        Use 64-bit intermediate to avoid overflow at high RPM × high base_hz values. */
     uint32_t hz_cents = (uint32_t)(((uint64_t)rpm_val * vfd_base_hz) / vfd_base_rpm);
-    if (hz_cents > 40000) hz_cents = 40000;
+
+    /* Cap at the configured max frequency; back-calculate the actual RPM applied. */
+    bool clamped = false;
+    if (hz_cents > vfd_max_hz) {
+        hz_cents = vfd_max_hz;
+        clamped  = true;
+    }
+    int actual_rpm = (int)(((uint64_t)hz_cents * vfd_base_rpm) / vfd_base_hz);
+
     bool ok = vfd_set_freq((uint16_t)hz_cents);
-    char buf[48];
-    snprintf(buf, sizeof(buf), ok ? "Speed set: %d RPM (%.2f Hz)" : "VFD comms error",
-             rpm_val, hz_cents / 100.0f);
-    server.send(ok ? 200 : 502, "text/plain", buf);
+    char buf[80];
+    if (!ok) {
+        snprintf(buf, sizeof(buf), "VFD comms error");
+        server.send(502, "text/plain", buf);
+    } else if (clamped) {
+        snprintf(buf, sizeof(buf),
+                 "Input exceeded max \u2014 speed set to %d RPM (%.2f Hz)",
+                 actual_rpm, hz_cents / 100.0f);
+        server.send(200, "text/plain", buf);
+    } else {
+        snprintf(buf, sizeof(buf), "Speed set: %d RPM (%.2f Hz)",
+                 actual_rpm, hz_cents / 100.0f);
+        server.send(200, "text/plain", buf);
+    }
 }
 
 static void handle_vfd_settings()
@@ -1359,10 +1420,18 @@ static void handle_vfd_status()
         vfd_comms_ok = false;
     }
 
-    char buf[200];
+    /* Pot is considered active if the ADC reads meaningfully above zero,
+       meaning a potentiometer is wired to the pin and controlling speed. */
+    bool pot_active = (analogRead(VFD_POT_PIN) > 50);
+
+    /* Lockout button: LOW = web VFD controls disabled */
+    bool web_lock = (digitalRead(VFD_LOCK_BTN) == LOW);
+
+    char buf[240];
     snprintf(buf, sizeof(buf),
              "{\"comms_ok\":%s,\"running\":%s,\"reverse\":%s,\"status\":%u,\"fault\":%u,"
-             "\"freq\":%u,\"output_freq\":%u,\"base_hz\":%u,\"base_rpm\":%u}",
+             "\"freq\":%u,\"output_freq\":%u,\"base_hz\":%u,\"base_rpm\":%u,"
+             "\"pot_active\":%s,\"web_lock\":%s}",
              vfd_comms_ok       ? "true" : "false",
              vfd_running        ? "true" : "false",
              vfd_reverse_active ? "true" : "false",
@@ -1371,7 +1440,9 @@ static void handle_vfd_status()
              (unsigned)vfd_freq_ref,
              (unsigned)vfd_output_freq,
              (unsigned)vfd_base_hz,
-             (unsigned)vfd_base_rpm);
+             (unsigned)vfd_base_rpm,
+             pot_active         ? "true" : "false",
+             web_lock           ? "true" : "false");
     server.send(200, "application/json", buf);
 }
 
@@ -1383,6 +1454,30 @@ static void show_overlay(const char *text, uint32_t duration_ms)
     lv_obj_t *box = lv_obj_get_parent(ip_overlay);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_HIDDEN);
     g_ip_show_until = duration_ms ? (millis() + duration_ms) : 0;
+}
+
+static void handle_wifi_scan()
+{
+    /* In AP-only mode the radio can't scan; switch to AP+STA for the duration. */
+    bool was_ap_only = (wifi_mode == MODE_AP);
+    if (was_ap_only) WiFi.mode(WIFI_AP_STA);
+
+    int n = WiFi.scanNetworks();   /* blocking scan — typically 2–4 s */
+
+    if (was_ap_only) WiFi.mode(WIFI_AP);   /* restore */
+
+    String json = "[";
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            if (i > 0) json += ",";
+            String ssid = WiFi.SSID(i);
+            ssid.replace("\"", "\\\"");
+            json += "\"" + ssid + "\"";
+        }
+    }
+    json += "]";
+    WiFi.scanDelete();
+    server.send(200, "application/json", json);
 }
 
 static void handle_set_wifi()
@@ -1466,7 +1561,7 @@ static void apply_wifi_config()
             WiFi.softAPConfig(local, local, IPAddress(255, 255, 255, 0));
             WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
             current_ip = "192.168.4.1";
-            dnsServer.start(53, WIFI_HOSTNAME, local);
+            dnsServer.start(53, "*", local);
             server.begin();
             return;   /* return early — don't save, preserving STA config */
         }
@@ -1481,7 +1576,7 @@ static void apply_wifi_config()
         WiFi.softAPConfig(local, local, IPAddress(255, 255, 255, 0));
         WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
         current_ip = "192.168.4.1";
-        dnsServer.start(53, WIFI_HOSTNAME, local);
+        dnsServer.start(53, "*", local);
 
         /* duration_ms=0 → stays visible until explicitly hidden or overwritten;
            the overlay will be on screen when loop() starts and cleared on next button press */
@@ -1666,6 +1761,7 @@ static void setup_wifi()
     server.on("/set-ppr",      HTTP_POST, handle_set_ppr);
     server.on("/set-pulley",   HTTP_POST, handle_set_pulley);
     server.on("/set-wifi",     HTTP_GET,  handle_set_wifi);
+    server.on("/wifi-scan",    HTTP_GET,  handle_wifi_scan);
     server.on("/vfd-rpm",      HTTP_POST, handle_vfd_rpm);
     server.on("/vfd-run",      HTTP_POST, handle_vfd_run);
     server.on("/vfd-reverse",  HTTP_POST, handle_vfd_reverse);
@@ -1674,6 +1770,11 @@ static void setup_wifi()
     server.on("/vfd-freq",     HTTP_POST, handle_vfd_freq);
     server.on("/vfd-settings", HTTP_POST, handle_vfd_settings);
     server.on("/vfd-status",   HTTP_GET,  handle_vfd_status);
+    /* Captive portal: redirect any unrecognised URL to the root page */
+    server.onNotFound([]() {
+        server.sendHeader("Location", "/", true);
+        server.send(302, "text/plain", "");
+    });
     apply_wifi_config();
 }
 
@@ -1696,9 +1797,11 @@ void setup()
     pinMode(VFD_BTN_REVERSE, INPUT_PULLUP);
     pinMode(VFD_BTN_STOP,    INPUT_PULLUP);
     pinMode(VFD_POT_PIN,     INPUT);   /* ADC — no pullup */
+    analogReadResolution(12);          /* Force 12-bit ADC (0–4095); default is 10-bit */
 
     /* RPM source select button */
-    pinMode(RPM_SRC_BTN, INPUT_PULLUP);
+    pinMode(RPM_SRC_BTN,  INPUT_PULLUP);
+    pinMode(VFD_LOCK_BTN, INPUT_PULLUP);
 
     /* Initialise display */
     tft.begin();
@@ -1870,8 +1973,12 @@ void loop()
         int32_t raw = analogRead(VFD_POT_PIN);   /* 0–4095 (12-bit) */
         if (abs(raw - last_pot_raw) > VFD_POT_DEADBAND) {
             last_pot_raw = raw;
-            /* Map 0–4095 → 0–vfd_max_hz (0.01 Hz units) */
-            uint32_t hz_cents = ((uint32_t)raw * vfd_max_hz) / 4095;
+            /* Map POT_MIN–4095 → 0–vfd_max_hz, clamping below min to zero */
+            uint32_t hz_cents = 0;
+            if (raw > VFD_POT_MIN) {
+                hz_cents = ((uint32_t)(raw - VFD_POT_MIN) * vfd_max_hz)
+                           / (4095 - VFD_POT_MIN);
+            }
             vfd_set_freq((uint16_t)hz_cents);
         }
     }
