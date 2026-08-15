@@ -327,6 +327,95 @@ Settings are stored in 148 bytes of emulated EEPROM:
 
 > The magic byte is checked on every boot. If it does not match `0xB0`, all settings revert to firmware defaults and EEPROM is re-initialised on next save.
 
+## A1000 Modbus RTU Simulator (`pico_simulator`)
+
+[`src/simulator.cpp`](src/simulator.cpp) implements a second firmware target that turns a standard Raspberry Pi Pico (RP2040) into a Yaskawa A1000 stand-in on the RS-485 bus. It is useful for bench-testing the main firmware without a real VFD.
+
+### What it simulates
+
+- Modbus RTU slave at address `1`, 9600 bps, 8-N-2
+- **FC 03** Read Holding Registers
+- **FC 06** Write Single Register
+- **FC 08** Loopback diagnostic (sub-function 0x0000 only)
+
+| Register | Access | Description |
+|---|---|---|
+| `0x0001` | R/W | Command word — bit 0 = run forward, bit 1 = run reverse, bit 3 = fault reset |
+| `0x0002` | R/W | Frequency reference (0.01 Hz units) |
+| `0x0020` | R | Status word — mirrors running / reverse / fault / ready bits |
+| `0x0021` | R | Fault code (0 = no fault) |
+| `0x0025` | R | Output frequency — ramps toward frequency reference when running |
+
+All other registers within the normal A1000 address range return `0x0000` on read; writes to unknown registers return Modbus exception 02 (Illegal Data Address).
+
+The simulated drive ramps its output frequency at ~0.5 Hz/s toward the commanded reference, giving a realistic response to acceleration/deceleration commands.
+
+The onboard LED blinks at **1 Hz** while the simulated drive is running, and **0.25 Hz** while stopped.
+
+### Simulator wiring (MAX485 breakout → standard Pico)
+
+Same pinout as the main controller — connect both boards to the same A/B bus pair:
+
+| Pico GPIO | Pico Pin | MAX485 Pin | Direction |
+|---|---|---|---|
+| GPIO 8 (Serial2 TX) | Pin 11 | DI | Pico → MAX485 |
+| GPIO 9 (Serial2 RX) | Pin 12 | RO | MAX485 → Pico |
+| GPIO 7 | Pin 10 | DE + RE (tied) | Transmit enable |
+| 3.3 V | Pin 36 | VCC | — |
+| GND | Any GND | GND | — |
+
+### Building and flashing the simulator
+
+```
+pio run -e pico_simulator
+pio run -e pico_simulator --target upload
+```
+
+`pio run` (without `-e`) only builds the `pico2w` main firmware (`default_envs = pico2w`).
+
+## Serial Debug Monitoring
+
+Both firmware targets print VFD activity to USB Serial at **115200 baud**. Connect via USB and open a serial monitor to observe all Modbus transactions in real time.
+
+```
+pio device monitor -b 115200
+```
+
+### Main firmware (`pico2w`) log messages
+
+| Prefix | When printed |
+|---|---|
+| `[VFD] init …` | Once at boot, after `vfd_init()` configures UART1 |
+| `[VFD TX] 01 06 …` | Every frame sent to the drive (raw hex bytes) |
+| `[VFD RX] 01 06 …` | Every frame received from the drive (raw hex bytes) |
+| `[VFD RX] timeout — no bytes` | Response window elapsed with no data |
+| `[VFD] CMD run-forward` | `vfd_run()` called (button, web UI, or API) |
+| `[VFD] CMD run-reverse` | `vfd_reverse()` called |
+| `[VFD] CMD stop` | `vfd_stop()` called |
+| `[VFD] CMD fault-reset` | `vfd_reset_fault()` called |
+| `[VFD] CMD set-freq 6000 (60.00 Hz)` | `vfd_set_freq()` called (potentiometer or web UI) |
+| `[VFD] FC06 reg=0x… val=0x…  OK` | Write single register succeeded |
+| `[VFD] FC06 reg=0x… val=0x…  FAIL (…)` | Write failed — reason in parentheses |
+| `[VFD] FC03 reg=0x… cnt=2  OK  [0]=0x…  [1]=0x…` | Read holding registers succeeded, values shown |
+| `[VFD] FC03 reg=0x… cnt=2  FAIL (…)` | Read failed — reason in parentheses |
+| `[VFD] poll  status=0x…  fault=0x… (…)  running=…` | Printed whenever the polled status or fault code changes |
+| `[VFD] poll — comms lost` | First poll failure after a previously successful comms state |
+
+### Simulator (`pico_simulator`) log messages
+
+| Prefix | When printed |
+|---|---|
+| `[SIM] A1000 simulator ready …` | Once at boot |
+| `[SIM RX] 01 03 …` | Every frame received from the master (raw hex bytes) |
+| `[SIM] bad CRC — discarded` | Frame received with invalid CRC |
+| `[SIM] FC=0x03 slave=1` | Decoded function code and slave address |
+| `[SIM] FC03 read reg=0x… cnt=…` | FC 03 read request decoded |
+| `[SIM] FC06 write reg=0x… val=0x…` | FC 06 write request decoded |
+| `[SIM] FC06 reg=0x… — illegal address, sending exception` | Write to unimplemented register |
+| `[SIM TX] 01 03 …` | Every response frame sent back to the master (raw hex bytes) |
+
+> Only changes to the VFD status word or fault code are logged during polling — steady-state polls that return the same values produce no output, keeping the monitor readable.
+
 ## Building
 
 Built with [PlatformIO](https://platformio.org/). Open the project folder and run:
@@ -353,7 +442,7 @@ pio run --target upload
 | `WiFi` | (bundled with arduino-pico) |
 | `EEPROM` | (bundled with arduino-pico) |
 
-Platform: `https://github.com/maxgerhardt/platform-raspberrypi.git`  
+Platform: `https://github.com/maxgerhardt/platform-raspberrypi.git`
 Board: `rpipico2w`
 
 ## Reference Files

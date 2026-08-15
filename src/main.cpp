@@ -333,6 +333,14 @@ static void vfd_send_frame(const uint8_t *frame, uint8_t len)
     Serial2.write(frame, len);
     Serial2.flush();                /* blocks until TX shift register is empty */
     digitalWrite(VFD_DE_PIN, LOW);
+
+    Serial.print("[VFD TX]");
+    for (uint8_t i = 0; i < len; i++) {
+        char tmp[4];
+        snprintf(tmp, sizeof(tmp), " %02X", frame[i]);
+        Serial.print(tmp);
+    }
+    Serial.println();
 }
 
 /* Read up to max_len bytes with a timeout.  Returns actual byte count received.
@@ -347,6 +355,18 @@ static uint8_t vfd_recv_frame(uint8_t *buf, uint8_t max_len, uint32_t timeout_ms
             buf[idx++] = (uint8_t)Serial2.read();
             t = millis();           /* reset timeout on each received byte */
         }
+    }
+
+    if (idx > 0) {
+        Serial.print("[VFD RX]");
+        for (uint8_t i = 0; i < idx; i++) {
+            char tmp[4];
+            snprintf(tmp, sizeof(tmp), " %02X", buf[i]);
+            Serial.print(tmp);
+        }
+        Serial.println();
+    } else {
+        Serial.println("[VFD RX] timeout — no bytes");
     }
     return idx;
 }
@@ -376,13 +396,22 @@ static bool vfd_write_reg(uint16_t reg, uint16_t value)
 
     uint8_t resp[8];
     uint8_t n = vfd_recv_frame(resp, 8);
-    if (n < 8) return false;
+    if (n < 8) {
+        Serial.printf("[VFD] FC06 reg=0x%04X val=0x%04X  FAIL (short response: %u bytes)\n",
+                      reg, value, n);
+        return false;
+    }
     uint16_t resp_crc = (uint16_t)resp[7] << 8 | resp[6];
-    if (modbus_crc(resp, 6) != resp_crc) return false;
-    /* FC 06 success: drive echoes the request unchanged */
-    return (resp[0] == frame[0] && resp[1] == 0x06 &&
-            resp[2] == frame[2] && resp[3] == frame[3] &&
-            resp[4] == frame[4] && resp[5] == frame[5]);
+    if (modbus_crc(resp, 6) != resp_crc) {
+        Serial.printf("[VFD] FC06 reg=0x%04X val=0x%04X  FAIL (bad CRC)\n", reg, value);
+        return false;
+    }
+    bool ok = (resp[0] == frame[0] && resp[1] == 0x06 &&
+               resp[2] == frame[2] && resp[3] == frame[3] &&
+               resp[4] == frame[4] && resp[5] == frame[5]);
+    Serial.printf("[VFD] FC06 reg=0x%04X val=0x%04X  %s\n",
+                  reg, value, ok ? "OK" : "FAIL (echo mismatch)");
+    return ok;
 }
 
 /* FC 03 — Read Holding Registers.  Fills out[] with `count` register values.
@@ -407,29 +436,56 @@ static bool vfd_read_regs(uint16_t start_reg, uint8_t count, uint16_t *out)
 
     uint8_t resp[40];
     uint8_t n = vfd_recv_frame(resp, resp_len);
-    if (n < resp_len) return false;
+    if (n < resp_len) {
+        Serial.printf("[VFD] FC03 reg=0x%04X cnt=%u  FAIL (short response: %u bytes)\n",
+                      start_reg, count, n);
+        return false;
+    }
     uint16_t resp_crc = (uint16_t)resp[n - 1] << 8 | resp[n - 2];
-    if (modbus_crc(resp, n - 2) != resp_crc) return false;
-    if (resp[0] != vfd_slave || resp[1] != 0x03) return false;
+    if (modbus_crc(resp, n - 2) != resp_crc) {
+        Serial.printf("[VFD] FC03 reg=0x%04X cnt=%u  FAIL (bad CRC)\n", start_reg, count);
+        return false;
+    }
+    if (resp[0] != vfd_slave || resp[1] != 0x03) {
+        Serial.printf("[VFD] FC03 reg=0x%04X cnt=%u  FAIL (unexpected slave/FC in response)\n",
+                      start_reg, count);
+        return false;
+    }
     for (uint8_t i = 0; i < count; i++)
         out[i] = (uint16_t)resp[3 + i * 2] << 8 | resp[4 + i * 2];
+    Serial.printf("[VFD] FC03 reg=0x%04X cnt=%u  OK", start_reg, count);
+    for (uint8_t i = 0; i < count; i++) Serial.printf("  [%u]=0x%04X", i, out[i]);
+    Serial.println();
     return true;
 }
 
 /* ---- High-level VFD commands ---- */
 
 /* Run forward at whatever frequency reference is currently set */
-static bool vfd_run()     { return vfd_write_reg(0x0001, 0x0001); }
+static bool vfd_run()
+{
+    Serial.println("[VFD] CMD run-forward");
+    return vfd_write_reg(0x0001, 0x0001);
+}
 
 /* Run reverse */
-static bool vfd_reverse() { return vfd_write_reg(0x0001, 0x0002); }
+static bool vfd_reverse()
+{
+    Serial.println("[VFD] CMD run-reverse");
+    return vfd_write_reg(0x0001, 0x0002);
+}
 
 /* Stop (coast / decelerate per drive config) */
-static bool vfd_stop() { return vfd_write_reg(0x0001, 0x0000); }
+static bool vfd_stop()
+{
+    Serial.println("[VFD] CMD stop");
+    return vfd_write_reg(0x0001, 0x0000);
+}
 
 /* Reset active fault — rising edge on bit 3, then clear */
 static bool vfd_reset_fault()
 {
+    Serial.println("[VFD] CMD fault-reset");
     bool ok = vfd_write_reg(0x0001, 0x0008);
     delay(50);
     ok &= vfd_write_reg(0x0001, 0x0000);
@@ -442,6 +498,8 @@ static bool vfd_set_freq(uint16_t hz_hundredths)
 {
     if (hz_hundredths > vfd_max_hz) hz_hundredths = vfd_max_hz;
     vfd_freq_ref = hz_hundredths;
+    Serial.printf("[VFD] CMD set-freq %u (%.2f Hz)\n",
+                  hz_hundredths, hz_hundredths / 100.0f);
     return vfd_write_reg(0x0002, hz_hundredths);
 }
 
@@ -489,11 +547,23 @@ static void vfd_poll()
 {
     uint16_t regs[2];
     bool ok = vfd_read_regs(0x0020, 2, regs);   /* 0x0020 = status, 0x0021 = fault code */
+    bool was_ok = vfd_comms_ok;
     vfd_comms_ok = ok;
-    if (!ok) return;
+    if (!ok) {
+        if (was_ok) Serial.println("[VFD] poll — comms lost");
+        return;
+    }
 
     uint16_t new_status = regs[0];
     uint16_t new_fault  = regs[1];
+
+    /* Log any change in status word or fault code */
+    if (new_status != vfd_status_word || new_fault != vfd_fault_code) {
+        Serial.printf("[VFD] poll  status=0x%04X  fault=0x%04X (%s)  running=%d\n",
+                      new_status, new_fault,
+                      new_fault ? vfd_fault_name(new_fault) : "none",
+                      (new_status & 0x0001) != 0);
+    }
 
     /* Fault appeared */
     if (new_fault != 0 && new_fault != vfd_fault_code) {
@@ -519,6 +589,7 @@ static void vfd_init()
     pinMode(VFD_DE_PIN, OUTPUT);
     digitalWrite(VFD_DE_PIN, LOW);   /* receive mode */
     Serial2.begin(VFD_BAUD, SERIAL_8N2);
+    Serial.println("[VFD] init — UART1 9600 8-N-2 ready");
 }
 
 /* ==========================================================================
@@ -1466,6 +1537,8 @@ static void setup_wifi()
 
 void setup()
 {
+    Serial.begin(115200);
+
     /* Encoder — interrupt on rising edge of channel A */
     pinMode(ENCODER_A, INPUT_PULLUP);
     pinMode(ENCODER_B, INPUT_PULLUP);
