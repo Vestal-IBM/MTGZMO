@@ -2,6 +2,8 @@
 
 A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live RPM on a GC9A01 round TFT display using LVGL 8, drives a stepper motor via a TMC5160 at a configurable ratio of the measured RPM, and controls a Yaskawa A1000 VFD over MEMOBUS/Modbus RTU. Designed for hobbing machine synchronisation — the stepper speed tracks the spindle speed according to a user-defined hob thread / gear tooth count.
 
+> ⚠️ **The TMC5160 stepper output has not been hardware-tested yet.** The ratio calculations, VMAX register math, and driver initialisation are implemented but unverified on a real motor. Do not rely on the stepper output for machine synchronisation until it has been validated.
+
 ## Features
 
 - Live RPM tachometer gauge on a 240×240 GC9A01 round display (LVGL 8, needle + digital readout)
@@ -10,10 +12,10 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - TMC5160 stepper driver in StealthChop velocity mode — speed tracks encoder RPM via hob/gear ratio, corrected for belt/pulley gearing
 - Stepper driver abstraction — swap to a different driver by replacing two functions only
 - Yaskawa A1000 VFD control over MEMOBUS/Modbus RTU (RS-485): run forward, run reverse, stop, set speed, fault reset
-- Physical VFD controls: Start/Stop toggle button, Reverse button, potentiometer for continuous speed adjustment
+- Physical VFD controls: Start/Stop toggle button, Reverse button, Stop button, potentiometer for continuous speed adjustment (0–max Hz), hardware lockout switch for web controls (GPIO 22)
 - VFD fault monitoring — on-screen overlay on any new trip, and on fault clearance
 - WiFi web UI at **`http://gizmo.mt`** (AP mode) to adjust all parameters at runtime
-- AP mode SSID `MTGizmo` — no router needed; DNS resolves `gizmo.mt`
+- AP mode SSID `MTGizmo` — no router needed; captive portal auto-opens browser on connect
 - Station mode support with automatic fallback to AP if connection fails
 - Physical button (GPIO 14): short press shows current IP on display for 5 s, long press (2 s) forces AP mode
 - On-screen overlay notifications for all WiFi mode transitions and VFD faults
@@ -30,8 +32,8 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - External motor PSU (8–40 V)
 - SparkFun RS-485 Breakout (or any MAX485-compatible half-duplex transceiver)
 - Yaskawa A1000 VFD
-- 3× momentary push buttons (GPIO 14, 4, 5)
-- 10 kΩ potentiometer (GPIO 26 / ADC0)
+- 6× momentary push buttons / switches (GPIO 4, 5, 6, 14, 16, 22)
+- 2 kΩ–100 kΩ potentiometer (GPIO 26 / ADC0) — 10 kΩ recommended
 
 ## Wiring
 
@@ -106,13 +108,16 @@ The SparkFun SP3485 is a 3.3 V RS-485 transceiver breakout. It is pin-compatible
 
 ### Buttons → Pico 2W
 
-All three buttons wire the same way: one leg to the GPIO, other leg to GND. All use the internal pullup — no external resistors needed.
+All buttons wire the same way: one leg to the GPIO, other leg to GND. All use the internal pullup — no external resistors needed.
 
 | Button | Pico 2W GPIO | Pico 2W Pin | Function |
 |---|---|---|---|
-| WiFi / IP | GPIO 14 | Pin 19 | Short press: show IP on display 5 s · Long press: force AP mode |
-| VFD Start/Stop | GPIO 4 | Pin 6 | Press toggles Run ↔ Stop based on current drive state |
+| WiFi / IP | GPIO 14 | Pin 19 | Short press: show IP on display 5 s · Long press (≥2 s): force AP mode |
+| VFD Start | GPIO 4 | Pin 6 | Press sends Run Forward command |
 | VFD Reverse | GPIO 5 | Pin 7 | Press sends Reverse command |
+| VFD Stop | GPIO 6 | Pin 9 | Press sends Stop command |
+| RPM Source | GPIO 16 | Pin 21 | Hold LOW to show VFD RPM on display; open (HIGH) for encoder RPM |
+| Web Lockout | GPIO 22 | Pin 29 | Hold LOW to disable all web VFD controls (speed input + run/stop/reverse/reset) |
 
 ### Potentiometer → Pico 2W
 
@@ -122,7 +127,7 @@ All three buttons wire the same way: one leg to the GPIO, other leg to GND. All 
 | Wiper (centre) | GPIO 26 (ADC0) | Pin 31 |
 | Right (3.3 V end) | 3.3 V | Pin 36 |
 
-> A 10 kΩ linear pot is recommended. The wiper voltage is read by the 12-bit ADC and mapped linearly to 0 – max frequency. A deadband of ±8 ADC counts prevents Modbus chatter while the pot is stationary. The pot and the web UI RPM input share the same frequency register; whichever was used last takes effect.
+> Any 2 kΩ–100 kΩ linear pot works; 10 kΩ recommended. The wiper voltage is read by the 12-bit ADC (forced via `analogReadResolution(12)`) and mapped from `VFD_POT_MIN` (100 counts) to 4095 → 0–max frequency. Full CCW maps to 0 Hz. Deadband is 32 counts (~0.5 Hz) to suppress ADC noise oscillation. While the pot is active (ADC > 50), the web speed input is greyed out in the UI.
 
 ## Configuration
 
@@ -235,21 +240,20 @@ See [`src/a1000_modbus.json`](src/a1000_modbus.json) for the complete register m
 
 ## Web UI
 
-Connect to the `MTGizmo` WiFi network (password: `hobbing1`) and open **`http://gizmo.mt`** in any browser.
+Connect to the `MTGizmo` WiFi network (password: `hobbing1`). The captive portal should auto-open in your browser; if not, navigate to **`http://192.168.4.1`** manually.
 
 | Setting | Value |
 |---|---|
 | SSID | `MTGizmo` |
 | Password | `hobbing1` |
-| IP | `192.168.4.1` |
-| Hostname (AP mode) | `http://gizmo.mt` |
+| IP (AP mode) | `192.168.4.1` |
 
 The UI has two tabs:
 
 ### Home tab
 
 - **Gear Ratio** card — enter *Threads on hob* and *Gear teeth*; the display shows the current ratio as `H : T`. Takes effect immediately and persists to EEPROM.
-- **VFD — Yaskawa A1000** card — shows live VFD status (Running / Stopped / No comms) and current output speed in RPM. Controls: RPM input + **Set RPM**, **Run ▶**, **◀ Reverse**, **Stop ■**, **Reset** (fault reset). The RPM is converted to a frequency command using the baseline scaling before sending via Modbus. Status auto-refreshes every 2 s.
+- **VFD — Yaskawa A1000** card — shows live VFD status (Running / Stopped / No comms), current speed, and setpoint in RPM. Controls: RPM input + **Set RPM**, **▶ Forward**, **◀ Reverse**, **Stop ■**, **Reset** (fault reset). All controls (including speed input) are disabled when the hardware lockout button (GPIO 22) is held LOW. The RPM is converted to a frequency command using the baseline scaling and capped at `vfd_max_hz` before sending via Modbus. Status auto-refreshes every 500 ms.
 
 ### Settings tab
 
@@ -257,9 +261,9 @@ The UI has two tabs:
 - **Encoder PPR** card — set pulses per revolution (1–10 000). Presets: 100, 200, 400, 600, 1000, 2400.
 - **Stepper Pulley** card — set driver and driven pulley tooth counts. Set both to `1` for direct drive.
 - **VFD Settings** card — set the Modbus slave address (1–31), maximum frequency clamp (Hz), baseline frequency (Hz), and RPM at baseline frequency. All persist to EEPROM.
-- **WiFi** card — switch between AP and Station mode. In Station mode enter your router SSID and password; if connection fails within 20 s the device falls back to AP mode automatically. The Station credentials are preserved even after a fallback.
+- **WiFi** card — switch between AP and Station mode. In Station mode, click **Scan** to populate a dropdown of visible networks (or manually type the SSID); enter password and apply. If connection fails within 20 s the device falls back to AP mode automatically. The Station credentials are preserved even after a fallback.
 
-> `http://gizmo.mt` resolves only while connected to the Pico's own AP. In Station mode use the IP address shown in the WiFi card, or press the physical button to display it on screen.
+> Captive portal (auto-open browser) only works in AP mode. In Station mode use the IP address shown in the WiFi card, or press the physical button (GPIO 14) to display it on the round display for 5 s.
 
 ### Web API endpoints
 
@@ -271,13 +275,15 @@ The UI has two tabs:
 | `/set-ppr` | POST | `ppr` | Set encoder PPR |
 | `/set-pulley` | POST | `driver`, `driven` | Set pulley tooth counts |
 | `/set-wifi` | GET | `mode`, `ssid`, `pass` | Configure WiFi |
-| `/vfd-rpm` | POST | `rpm` | Set VFD speed in RPM (converted to Hz by firmware) |
+| `/wifi-scan` | GET | — | Scan for WiFi networks; returns JSON array of SSIDs |
+| `/vfd-rpm` | POST | `rpm` | Set VFD speed in RPM (converted to Hz, capped at vfd_max_hz) |
 | `/vfd-run` | POST | — | Send run (forward) command to VFD |
+| `/vfd-reverse` | POST | — | Send run (reverse) command to VFD |
 | `/vfd-stop` | POST | — | Send stop command to VFD |
 | `/vfd-freq` | POST | `hz` (0.01 Hz units) | Set VFD frequency reference directly in 0.01 Hz units |
 | `/vfd-reset` | POST | — | Reset active VFD fault |
 | `/vfd-settings` | POST | `slave`, `maxhz`, `basehz`, `baserpm` | Set slave address, max/baseline frequency, baseline RPM |
-| `/vfd-status` | GET | — | Returns JSON: `{comms_ok, running, status, fault, freq, output_freq, base_hz, base_rpm}` |
+| `/vfd-status` | GET | — | Returns JSON: `{comms_ok, running, reverse, status, fault, freq, output_freq, base_hz, base_rpm, pot_active, web_lock}` |
 
 ## Physical Controls
 
@@ -288,17 +294,29 @@ The UI has two tabs:
 | Short press (< 2 s) | Shows the current IP address on the display for 5 s |
 | Long press (≥ 2 s) | Forces a switch to AP mode (`MTGizmo` / `192.168.4.1`) |
 
-### VFD Start/Stop button (GPIO 4)
+### VFD Start button (GPIO 4)
 
-Toggles the drive on each press. If the drive is currently running it sends Stop; if stopped it sends Run forward. Edge-triggered — holding the button does not repeat.
+Sends Run Forward command. Edge-triggered — holding the button does not repeat.
 
 ### VFD Reverse button (GPIO 5)
 
 Sends a single Reverse command (command word `0x0002`) on each press. Edge-triggered.
 
+### VFD Stop button (GPIO 6)
+
+Sends Stop command. Edge-triggered.
+
+### RPM source select (GPIO 16)
+
+Hold LOW to display VFD RPM on the tachometer (read from the drive's output frequency register). Leave open (HIGH, default) to display encoder RPM. Switching between sources shows a brief "RPM: VFD" or "RPM: Encoder" overlay.
+
+### Web lockout button (GPIO 22)
+
+Hold LOW to disable all VFD controls in the web UI: the speed input, Set RPM button, Forward, Reverse, Stop, and Reset buttons are all greyed out and non-functional. The hardware pot and physical buttons remain operational. The UI shows "Controls locked by hardware switch" below the buttons while active.
+
 ### VFD speed potentiometer (GPIO 26 / ADC0)
 
-Sampled every 50 ms. Maps the 12-bit ADC reading (0–4095) linearly across 0 – `vfd_max_hz`. Only sends a new Modbus write when the reading changes by more than 8 ADC counts.
+Sampled every 50 ms. The 12-bit ADC (0–4095) is mapped from `VFD_POT_MIN` (100 counts, configurable) to 4095 → 0–`vfd_max_hz`. Full counterclockwise = 0 Hz. Only sends a new Modbus write when the reading changes by more than 32 ADC counts (~0.5 Hz hysteresis), preventing oscillation from ADC noise. While the pot ADC reads > 50 counts, the web speed input and Set RPM button are greyed out in the UI with a "Speed controlled by potentiometer" note.
 
 ## Stepper Driver Abstraction
 
