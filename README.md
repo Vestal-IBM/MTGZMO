@@ -9,7 +9,8 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - Exponentially smoothed RPM reading from a quadrature encoder (direction-aware)
 - TMC5160 stepper driver in StealthChop velocity mode — speed tracks encoder RPM via hob/gear ratio, corrected for belt/pulley gearing
 - Stepper driver abstraction — swap to a different driver by replacing two functions only
-- Yaskawa A1000 VFD control over MEMOBUS/Modbus RTU (RS-485): run, stop, set frequency, fault reset
+- Yaskawa A1000 VFD control over MEMOBUS/Modbus RTU (RS-485): run forward, run reverse, stop, set speed, fault reset
+- Physical VFD controls: Start/Stop toggle button, Reverse button, potentiometer for continuous speed adjustment
 - VFD fault monitoring — on-screen overlay on any new trip, and on fault clearance
 - WiFi web UI at **`http://gizmo.mt`** (AP mode) to adjust all parameters at runtime
 - AP mode SSID `MTGizmo` — no router needed; DNS resolves `gizmo.mt`
@@ -28,7 +29,8 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 - External motor PSU (8–40 V)
 - SparkFun RS-485 Breakout (or any MAX485-compatible half-duplex transceiver)
 - Yaskawa A1000 VFD
-- Momentary push button (GPIO 14 to GND)
+- 3× momentary push buttons (GPIO 14, 4, 5)
+- 10 kΩ potentiometer (GPIO 26 / ADC0)
 
 ## Wiring
 
@@ -97,14 +99,25 @@ Connect your 2-phase stepper motor coils to the **A1/A2** and **B1/B2** terminal
 
 > Terminate with a 120 Ω resistor across A/B at the far end of the cable if the bus is long or noisy.
 
-### Button → Pico 2W
+### Buttons → Pico 2W
 
-| Button Pin | Pico 2W GPIO | Pico 2W Pin |
+All three buttons wire the same way: one leg to the GPIO, other leg to GND. All use the internal pullup — no external resistors needed.
+
+| Button | Pico 2W GPIO | Pico 2W Pin | Function |
+|---|---|---|---|
+| WiFi / IP | GPIO 14 | Pin 19 | Short press: show IP on display 5 s · Long press: force AP mode |
+| VFD Start/Stop | GPIO 4 | Pin 6 | Press toggles Run ↔ Stop based on current drive state |
+| VFD Reverse | GPIO 5 | Pin 7 | Press sends Reverse command |
+
+### Potentiometer → Pico 2W
+
+| Pot terminal | Connection | Pico 2W Pin |
 |---|---|---|
-| One leg | GPIO 14 | Pin 19 |
-| Other leg | GND | Any GND |
+| Left (GND end) | GND | Any GND |
+| Wiper (centre) | GPIO 26 (ADC0) | Pin 31 |
+| Right (3.3 V end) | 3.3 V | Pin 36 |
 
-> GPIO 14 is pulled up internally. Pressing the button pulls it LOW.
+> A 10 kΩ linear pot is recommended. The wiper voltage is read by the 12-bit ADC and mapped linearly to 0 – max frequency. A deadband of ±8 ADC counts prevents Modbus chatter while the pot is stationary. The pot and the web UI RPM input share the same frequency register; whichever was used last takes effect.
 
 ## Configuration
 
@@ -231,7 +244,7 @@ The UI has two tabs:
 ### Home tab
 
 - **Gear Ratio** card — enter *Threads on hob* and *Gear teeth*; the display shows the current ratio as `H : T`. Takes effect immediately and persists to EEPROM.
-- **VFD — Yaskawa A1000** card — shows live VFD status (Running / Stopped / No comms) and current output speed in RPM. Controls: RPM input + **Set RPM**, **Run**, **Stop**, **Reset** (fault reset). The RPM is converted to a frequency command using the baseline scaling before sending via Modbus. Status auto-refreshes every 2 s.
+- **VFD — Yaskawa A1000** card — shows live VFD status (Running / Stopped / No comms) and current output speed in RPM. Controls: RPM input + **Set RPM**, **Run ▶**, **◀ Reverse**, **Stop ■**, **Reset** (fault reset). The RPM is converted to a frequency command using the baseline scaling before sending via Modbus. Status auto-refreshes every 2 s.
 
 ### Settings tab
 
@@ -261,12 +274,26 @@ The UI has two tabs:
 | `/vfd-settings` | POST | `slave`, `maxhz`, `basehz`, `baserpm` | Set slave address, max/baseline frequency, baseline RPM |
 | `/vfd-status` | GET | — | Returns JSON: `{comms_ok, running, status, fault, freq, base_hz, base_rpm}` |
 
-## Physical Button (GPIO 14)
+## Physical Controls
+
+### WiFi / IP button (GPIO 14)
 
 | Press | Action |
 |---|---|
 | Short press (< 2 s) | Shows the current IP address on the display for 5 s |
 | Long press (≥ 2 s) | Forces a switch to AP mode (`MTGizmo` / `192.168.4.1`) |
+
+### VFD Start/Stop button (GPIO 4)
+
+Toggles the drive on each press. If the drive is currently running it sends Stop; if stopped it sends Run forward. Edge-triggered — holding the button does not repeat.
+
+### VFD Reverse button (GPIO 5)
+
+Sends a single Reverse command (command word `0x0002`) on each press. Edge-triggered.
+
+### VFD speed potentiometer (GPIO 26 / ADC0)
+
+Sampled every 50 ms. Maps the 12-bit ADC reading (0–4095) linearly across 0 – `vfd_max_hz`. Only sends a new Modbus write when the reading changes by more than 8 ADC counts.
 
 ## Stepper Driver Abstraction
 
@@ -279,11 +306,11 @@ To substitute a different driver (e.g. a step/dir driver like a DRV8825), replac
 
 ## EEPROM Layout
 
-Settings are stored in 144 bytes of emulated EEPROM:
+Settings are stored in 148 bytes of emulated EEPROM:
 
 | Bytes | Content |
 |---|---|
-| 0 | Magic byte (`0xAF`) — detects valid data |
+| 0 | Magic byte (`0xB0`) — detects valid data |
 | 1 | WiFi mode (0 = AP, 1 = STA) |
 | 2–65 | Station SSID (null-terminated, max 63 chars) |
 | 66–129 | Station password (null-terminated, max 63 chars) |

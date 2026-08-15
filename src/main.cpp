@@ -37,6 +37,10 @@ static volatile uint32_t pulley_driven  = 1;   /* Teeth on output-side pulley   
 #define TMC_RMS_CURRENT 1000        /* Motor RMS current in mA */
 
 #define BTN_PIN         14          /* IP display button — pulled up, active LOW */
+#define VFD_BTN_STARTSTOP  4        /* VFD Start/Stop toggle — pulled up, active LOW */
+#define VFD_BTN_REVERSE    5        /* VFD Reverse — pulled up, active LOW */
+#define VFD_POT_PIN       26        /* RPM potentiometer wiper — ADC0 (GPIO 26) */
+#define VFD_POT_DEADBAND   8        /* ADC counts of change required to trigger a write */
 #define MOTOR_STEPS     200         /* Full steps per revolution */
 #define MICROSTEPS      256         /* Microstep resolution */
 
@@ -1470,6 +1474,11 @@ void setup()
     /* IP button */
     pinMode(BTN_PIN, INPUT_PULLUP);
 
+    /* VFD physical controls */
+    pinMode(VFD_BTN_STARTSTOP, INPUT_PULLUP);
+    pinMode(VFD_BTN_REVERSE,   INPUT_PULLUP);
+    pinMode(VFD_POT_PIN,       INPUT);   /* ADC — no pullup */
+
     /* Initialise display */
     tft.begin();
     tft.setRotation(0);
@@ -1591,6 +1600,40 @@ void loop()
     }
 
     lv_timer_handler();
+
+    /* ---- VFD physical controls ---- */
+
+    /* Start/Stop button — edge-triggered toggle */
+    static bool vfd_ss_last = HIGH;
+    bool vfd_ss_now = digitalRead(VFD_BTN_STARTSTOP);
+    if (vfd_ss_last == HIGH && vfd_ss_now == LOW) {
+        /* Falling edge: toggle run/stop based on current drive state */
+        if (vfd_running) vfd_stop();
+        else             vfd_run();
+    }
+    vfd_ss_last = vfd_ss_now;
+
+    /* Reverse button — edge-triggered single shot */
+    static bool vfd_rev_last = HIGH;
+    bool vfd_rev_now = digitalRead(VFD_BTN_REVERSE);
+    if (vfd_rev_last == HIGH && vfd_rev_now == LOW) {
+        vfd_reverse();
+    }
+    vfd_rev_last = vfd_rev_now;
+
+    /* Potentiometer — read ADC, map to RPM, send on meaningful change */
+    static uint32_t last_pot_ms  = 0;
+    static int32_t  last_pot_raw = -1;   /* -1 forces a send on first iteration */
+    if (now - last_pot_ms >= 50) {       /* sample every 50 ms */
+        last_pot_ms = now;
+        int32_t raw = analogRead(VFD_POT_PIN);   /* 0–4095 (12-bit) */
+        if (abs(raw - last_pot_raw) > VFD_POT_DEADBAND) {
+            last_pot_raw = raw;
+            /* Map 0–4095 → 0–vfd_max_hz (0.01 Hz units) */
+            uint32_t hz_cents = ((uint32_t)raw * vfd_max_hz) / 4095;
+            vfd_set_freq((uint16_t)hz_cents);
+        }
+    }
 
     /* ---- Poll VFD status ---- */
     static uint32_t last_vfd_ms = 0;
