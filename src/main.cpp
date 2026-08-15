@@ -68,6 +68,10 @@ static volatile bool     vfd_comms_ok     = false;
    Set true around explicit commands; left false during background polls. */
 static bool vfd_log_raw = false;
 
+/* Tracks the last commanded direction — shared between physical buttons and web handlers.
+   false = forward, true = reverse. Start/Stop always uses this; Reverse flips it. */
+static bool vfd_reverse_active = false;
+
 /* ---- WiFi ---- */
 #define WIFI_AP_SSID  "MTGizmo"
 #define WIFI_AP_PASS  "hobbing1"        /* min 8 chars for WPA2 */
@@ -479,6 +483,7 @@ static bool vfd_run()
     vfd_log_raw = true;
     bool ok = vfd_write_reg(0x0001, 0x0001);
     vfd_log_raw = false;
+    if (ok) vfd_running = true;   /* optimistic update — poll will correct if wrong */
     return ok;
 }
 
@@ -489,6 +494,7 @@ static bool vfd_reverse()
     vfd_log_raw = true;
     bool ok = vfd_write_reg(0x0001, 0x0002);
     vfd_log_raw = false;
+    if (ok) vfd_running = true;
     return ok;
 }
 
@@ -499,6 +505,7 @@ static bool vfd_stop()
     vfd_log_raw = true;
     bool ok = vfd_write_reg(0x0001, 0x0000);
     vfd_log_raw = false;
+    if (ok) vfd_running = false;
     return ok;
 }
 
@@ -1146,14 +1153,21 @@ static uint32_t g_ip_show_until = 0;
 
 static void handle_vfd_run()
 {
-    bool ok = vfd_run();
+    /* Run in whatever direction is currently active — same as physical Start button */
+    bool ok = vfd_reverse_active ? vfd_reverse() : vfd_run();
     server.send(ok ? 200 : 502, "text/plain", ok ? "Run command sent" : "VFD comms error");
 }
 
 static void handle_vfd_reverse()
 {
-    bool ok = vfd_reverse();
-    server.send(ok ? 200 : 502, "text/plain", ok ? "Reverse command sent" : "VFD comms error");
+    /* Flip direction state. Only send a command if already running — never starts the drive. */
+    vfd_reverse_active = !vfd_reverse_active;
+    if (vfd_running) {
+        bool ok = vfd_reverse_active ? vfd_reverse() : vfd_run();
+        server.send(ok ? 200 : 502, "text/plain", ok ? "Reverse command sent" : "VFD comms error");
+    } else {
+        server.send(200, "text/plain", "Direction set (drive stopped)");
+    }
 }
 
 static void handle_vfd_stop()
@@ -1709,21 +1723,32 @@ void loop()
 
     /* ---- VFD physical controls ---- */
 
-    /* Start/Stop button — edge-triggered toggle */
+    /* Start/Stop button — edge-triggered toggle.
+       Starts in whatever direction was last commanded; does not change direction. */
     static bool vfd_ss_last = HIGH;
     bool vfd_ss_now = digitalRead(VFD_BTN_STARTSTOP);
     if (vfd_ss_last == HIGH && vfd_ss_now == LOW) {
-        /* Falling edge: toggle run/stop based on current drive state */
-        if (vfd_running) vfd_stop();
-        else             vfd_run();
+        if (vfd_running) {
+            vfd_stop();
+        } else {
+            if (vfd_reverse_active) vfd_reverse();
+            else                    vfd_run();
+        }
     }
     vfd_ss_last = vfd_ss_now;
 
-    /* Reverse button — edge-triggered single shot */
+    /* Reverse button — flips direction state only.
+       If already running, sends the new direction command immediately.
+       If stopped, just updates direction for the next Start press — never starts the drive. */
     static bool vfd_rev_last = HIGH;
     bool vfd_rev_now = digitalRead(VFD_BTN_REVERSE);
     if (vfd_rev_last == HIGH && vfd_rev_now == LOW) {
-        vfd_reverse();
+        vfd_reverse_active = !vfd_reverse_active;
+        if (vfd_running) {
+            if (vfd_reverse_active) vfd_reverse();
+            else                    vfd_run();
+        }
+        /* if stopped: direction is remembered, no command sent */
     }
     vfd_rev_last = vfd_rev_now;
 
