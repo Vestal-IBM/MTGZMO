@@ -37,9 +37,13 @@ A Raspberry Pi Pico 2W firmware that reads a quadrature encoder, displays live R
 
 ## Wiring
 
-**Pinout references:**
-- [Raspberry Pi Pico 2W pinout](https://datasheets.raspberrypi.com/picow/pico-2-w-pinout.pdf) (RP2350, used as main controller)
-- [Raspberry Pi Pico pinout](https://datasheets.raspberrypi.com/pico/Pico-R3-A4-Pinout.pdf) (RP2040, used for the A1000 simulator)
+**Pico 2W (RP2350) — main controller**
+
+![Raspberry Pi Pico 2W pinout](assets/pico2w-pinout.svg)
+
+**Pico (RP2040) — A1000 simulator**
+
+![Raspberry Pi Pico pinout](assets/pico-pinout.svg)
 
 
 ### GC9A01 Display → Pico 2W (SPI0)
